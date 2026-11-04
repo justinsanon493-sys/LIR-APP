@@ -1,0 +1,21 @@
+# Exclus les donnees et secrets du contexte Docker.
+.env
+.env.*
+!.env.hebergement.example
+**/.env
+**/.env.*
+**/.session_secret
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite3
+**/*.log
+**/__pycache__/
+**/*.py[cod]
+**/sauvegardes/
+**/data/
+**/Nouveau dossier/
+app_avant_*.py
+wsgi_avant_*.py
+HEBERGEMENT_avant_*.txt

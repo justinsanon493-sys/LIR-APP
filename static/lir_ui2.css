@@ -1,0 +1,172 @@
+/* ==========================================================================
+   LIR - Couche de design v2
+   À charger APRÈS le <style> de app.py et APRÈS modern_ui.css.
+   Réutilise les noms de variables existants (--bg, --card, --vert...) :
+   aucune classe ni logique de app.py n'est modifiée.
+   Pour revenir en arrière : retirer la ligne <link> qui charge ce fichier.
+   ========================================================================== */
+
+/* ---------- 1. Tokens ---------- */
+:root{
+  /* Marque (texte blanc dessus : contraste ≥ 5:1) */
+  --brand:#0d7f3c; --brand-hover:#0b6e34; --brand-press:#095c2c;
+  --link:#0b7a3b;                      /* texte vert sur fond clair */
+  --ring:0 0 0 3px rgba(19,163,85,.35);
+
+  /* Surfaces (clair) */
+  --bg:#f4f7f5; --card:#ffffff; --surface-2:#eef3f0;
+  --txt:#0f1b14; --mut:#566b5f; --bord:#dde5e0;
+  --soft:rgba(13,127,60,.08);
+  --side:#0c1f15;
+
+  /* Statuts */
+  --ok:#0d7f3c;   --ok-bg:rgba(13,127,60,.12);
+  --warn:#a15c00; --warn-bg:rgba(240,165,0,.18);
+  --err:#c53030;  --err-bg:rgba(214,69,69,.13);
+  --info:#1d4ed8; --info-bg:rgba(37,99,235,.12);
+
+  /* Échelles */
+  --r:14px; --r-sm:10px; --r-lg:20px;
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:24px; --sp-6:32px;
+  --ombre:0 1px 2px rgba(15,40,25,.05),0 8px 24px rgba(15,40,25,.06);
+  --ombre-hover:0 2px 4px rgba(15,40,25,.06),0 14px 32px rgba(15,40,25,.10);
+  --t:.18s cubic-bezier(.4,0,.2,1);
+}
+@media(prefers-color-scheme:dark){:root{
+  --brand:#0d7f3c; --brand-hover:#119448; --brand-press:#0b6e34;
+  --link:#4ade80;
+  --bg:#080f0b; --card:#111b15; --surface-2:#17241c;
+  --txt:#e9f1ec; --mut:#9bb0a3; --bord:#243329;
+  --soft:rgba(74,222,128,.09);
+  --side:#060d09;
+  --ok:#4ade80;   --ok-bg:rgba(74,222,128,.13);
+  --warn:#fbbf24; --warn-bg:rgba(251,191,36,.14);
+  --err:#f87171;  --err-bg:rgba(248,113,113,.14);
+  --info:#60a5fa; --info-bg:rgba(96,165,250,.14);
+  --ombre:none; --ombre-hover:0 0 0 1px rgba(74,222,128,.25);
+  color-scheme:dark;
+}}
+
+/* ---------- 2. Base ---------- */
+html{scroll-behavior:smooth}
+body{font-feature-settings:"cv11","ss01";-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+a{color:var(--link)}
+:focus-visible{outline:2px solid var(--link);outline-offset:2px;border-radius:6px}
+::selection{background:var(--ok-bg)}
+*{scrollbar-width:thin;scrollbar-color:var(--bord) transparent}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--bord);border-radius:999px;border:3px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:var(--mut);background-clip:content-box;border:3px solid transparent}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ---------- 3. Menu latéral ---------- */
+.side{padding:20px 12px 18px;gap:2px}
+.logo{padding:2px 8px 16px}
+.logo-i{box-shadow:0 8px 20px rgba(13,127,60,.4)}
+.grp{margin:20px 12px 6px;font-size:.68rem;letter-spacing:.12em;color:#7f9c8a}
+.side a.l{position:relative;padding:9px 10px;border-radius:12px;transition:background var(--t),color var(--t)}
+.side a.l:hover{background:rgba(255,255,255,.06);color:#fff}
+.side a.l.on{background:rgba(74,222,128,.14);color:#fff}
+.side a.l.on::before{content:"";position:absolute;left:-12px;top:10px;bottom:10px;width:4px;border-radius:0 4px 4px 0;background:#4ade80}
+.side a.l.on i{background:var(--brand)}
+.rech input{height:40px;border-radius:12px}
+.side .boutique-lien{border-radius:14px;background:var(--brand);transition:background var(--t),transform var(--t)}
+.side .boutique-lien:hover{background:var(--brand-hover);transform:translateY(-1px)}
+
+/* ---------- 4. En-têtes de page ---------- */
+main{padding:32px 32px 80px}
+.entete{margin-bottom:var(--sp-5)}
+.entete h1{font-size:1.85rem;font-weight:800;letter-spacing:-.025em}
+.entete p{color:var(--mut);font-size:.95rem}
+
+/* ---------- 5. Cartes ---------- */
+.card{border-radius:var(--r-lg)!important;padding:20px;box-shadow:var(--ombre)!important;border:1px solid var(--bord)!important;transition:box-shadow var(--t),border-color var(--t)}
+.card:hover{box-shadow:var(--ombre-hover)!important}
+h2{font-size:1.05rem;font-weight:750}
+
+/* Cartes de statistiques : hauteur égale, chiffres alignés */
+.stats{align-items:stretch;gap:14px}
+.stat{display:flex!important;flex-direction:column;justify-content:space-between;gap:6px;min-height:104px;padding:16px 18px 16px 20px!important;border-radius:var(--r)!important;background:var(--card)!important;transition:transform var(--t),box-shadow var(--t),border-color var(--t)}
+.stat:before{width:4px}
+.stat b{font-variant-numeric:tabular-nums;font-size:1.75rem!important;font-weight:800!important;line-height:1.1}
+.stat span{font-size:.84rem;font-weight:550;color:var(--mut)}
+a.stat:hover,.stat[role=button]:hover,.stat[onclick]:hover,.stat:has(a):hover{transform:translateY(-2px);box-shadow:var(--ombre-hover)!important;border-color:var(--link)!important;cursor:pointer}
+.stat.on,.stat.actif,.stat[aria-current],.stat[aria-pressed=true]{border-color:var(--link)!important;box-shadow:var(--ring)}
+
+/* ---------- 6. Boutons ---------- */
+button,.btn{min-height:40px;padding:9px 18px;background:var(--brand);background-image:none;color:#fff;border-radius:999px;font-weight:650;box-shadow:0 1px 2px rgba(0,0,0,.18);transition:background var(--t),transform var(--t),box-shadow var(--t);filter:none}
+button:hover,.btn:hover{background:var(--brand-hover);filter:none;box-shadow:0 4px 14px rgba(13,127,60,.28)}
+button:active,.btn:active{background:var(--brand-press);transform:translateY(1px);box-shadow:none}
+button:focus-visible,.btn:focus-visible{outline:2px solid var(--link);outline-offset:3px}
+button[disabled],.btn[disabled]{opacity:.5;cursor:not-allowed;box-shadow:none}
+button.sec,.btn.sec{background:transparent;color:var(--link);border:1px solid var(--link);box-shadow:none}
+button.sec:hover,.btn.sec:hover{background:var(--soft);box-shadow:none}
+button.danger{background:transparent;color:var(--err);border:1px solid var(--err);box-shadow:none}
+button.danger:hover{background:var(--err-bg);box-shadow:none}
+.outil-app .btn{min-height:34px;padding:6px 14px;font-size:.82rem}
+
+/* ---------- 7. Formulaires ---------- */
+label{color:var(--mut);font-size:.82rem;font-weight:650}
+input,select,textarea{min-height:42px;padding:10px 13px;border:1px solid var(--bord);border-radius:var(--r-sm);background:var(--card);color:var(--txt);transition:border-color var(--t),box-shadow var(--t)}
+input:hover,select:hover,textarea:hover{border-color:var(--mut)}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--link);box-shadow:var(--ring)}
+input::placeholder,textarea::placeholder{color:var(--mut);opacity:.8}
+input[type=checkbox],input[type=radio]{min-height:0;accent-color:var(--brand)}
+
+/* ---------- 8. Tableaux ---------- */
+table{font-size:.92rem}
+th{position:sticky;top:0;background:var(--card);z-index:1;padding:12px 10px;font-size:.72rem;letter-spacing:.06em;border-bottom:1px solid var(--bord)}
+td{padding:13px 10px}
+tbody tr:hover td,table tr:hover td{background:var(--soft)}
+td:last-child,th:last-child{padding-right:14px}
+
+/* ---------- 9. Pastilles et étiquettes ---------- */
+.tag,.pastille{display:inline-flex;align-items:center;gap:5px;padding:3px 11px;border-radius:999px;font-size:.76rem;font-weight:650;line-height:1.5}
+.pastille{background:var(--ok-bg);color:var(--ok)}
+.pastille.ambre{background:var(--warn-bg);color:var(--warn)}
+.pastille.rouge{background:var(--err-bg);color:var(--err)}
+.livré,.payé{background:var(--ok-bg);color:var(--ok)}
+.annulé,.injoignable{background:var(--err-bg);color:var(--err)}
+.collecté{background:var(--warn-bg);color:var(--warn)}
+
+/* ---------- 10. Divers ---------- */
+.barre{height:10px}
+.vide{padding:36px 12px;font-size:.95rem}
+code{border-radius:6px}
+.msg .menu a{border-radius:var(--r-sm);padding:8px 12px}
+
+/* ---------- 11. Mobile ---------- */
+@media(max-width:900px){
+  main{padding:18px 14px 110px!important}
+  .entete h1{font-size:1.45rem}
+  .stats{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:10px!important}
+  .stat{min-height:92px;padding:13px 14px 13px 16px!important}
+  .stat b{font-size:1.45rem!important}
+  .haut{background:var(--brand)!important;background-image:none!important}
+  .bas{background:color-mix(in srgb,var(--card) 88%,transparent);-webkit-backdrop-filter:saturate(1.4) blur(14px);backdrop-filter:saturate(1.4) blur(14px)}
+  .bas>a,.bas summary{min-height:48px;justify-content:center}
+  .bas>a.on{color:var(--link);background:var(--soft)}
+  button,.btn,input,select,textarea{min-height:44px}
+  .feuille{border-radius:var(--r-lg)}
+}
+
+/* ---------- 12. Accessibilité : mouvement réduit ---------- */
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
+}
+
+/* ---------- 13. Page « Livraisons du jour » (.jr-kpis > a > .stat) ---------- */
+.jr-kpis{align-items:stretch;gap:14px}
+.jr-kpis>a{display:flex;border-radius:var(--r);text-decoration:none;color:inherit}
+.jr-kpis>a>.stat{flex:1;width:100%;min-height:104px}
+.jr-kpis>a:hover>.stat{transform:translateY(-2px);box-shadow:var(--ombre-hover)!important;border-color:var(--link)!important}
+.jr-kpis>a:focus-visible{outline:2px solid var(--link);outline-offset:3px}
+.jr-kpis .stat.on{outline:0!important;border-color:var(--link)!important;background:var(--soft)!important;box-shadow:var(--ring)!important}
+.jr-kpis .stat span{white-space:nowrap}
+.jr-kpis>a:first-child .stat span{white-space:normal}
+.jr-chips a{min-height:36px;display:inline-flex;align-items:center;transition:background var(--t),border-color var(--t)}
+.jr-chips a:hover{border-color:var(--link)}
+.jr-chips a.on{background:var(--brand);border-color:var(--brand)}
+.lv-item{border-radius:var(--r-sm);transition:border-color var(--t),background var(--t)}
+.carte-live{border-radius:var(--r)}
+@media(max-width:1100px){.jr-kpis>a>.stat span{white-space:normal}}

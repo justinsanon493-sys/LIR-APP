@@ -1,0 +1,6397 @@
+"""
+Base de données de livraisons — application locale.
+
+Lancer :  lancer.bat ou python app.py
+Ouvrir :  adresse affichee par lancer.bat (port 5001-5100)
+Base   :  Nouveau dossier/livraisons.db si cette base existe, sinon à côté de ce fichier
+"""
+import csv
+import io
+import json
+import logging
+import os
+import secrets
+import sqlite3
+import hmac
+import re
+import time
+import tempfile
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+
+from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, session, url_for
+from flask.sessions import SecureCookieSessionInterface
+from werkzeug.security import check_password_hash, generate_password_hash
+
+DOSSIER = os.path.dirname(os.path.abspath(__file__))
+DONNEES_PAR_DEFAUT = os.path.join(DOSSIER, "Nouveau dossier")
+DONNEES = os.environ.get("DONNEES_DIR") or (
+    DONNEES_PAR_DEFAUT
+    if os.path.isfile(os.path.join(DONNEES_PAR_DEFAUT, "livraisons.db"))
+    else DOSSIER
+)  # garde la base existante si l'application est lancée directement
+os.makedirs(DONNEES, exist_ok=True)
+DB = os.path.join(DONNEES, "livraisons.db")
+MODELE = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+
+app = Flask(__name__)
+
+
+def cle_session():
+    configuree = os.environ.get("APP_SESSION_SECRET")
+    if configuree:
+        return configuree
+    chemin = os.path.join(DONNEES, ".session_secret")
+    try:
+        descripteur = os.open(chemin, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descripteur, "w", encoding="utf-8") as fichier:
+            fichier.write(secrets.token_urlsafe(48))
+    except FileExistsError:
+        pass
+    try:
+        with open(chemin, encoding="utf-8") as fichier:
+            cle = fichier.read().strip()
+        return cle or secrets.token_urlsafe(48)
+    except OSError:
+        return secrets.token_urlsafe(48)
+
+
+app.secret_key = cle_session()
+app.config.update(
+    MAX_CONTENT_LENGTH=4 * 1024 * 1024,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "").lower() in {"1", "true", "yes"},
+    PERMANENT_SESSION_LIFETIME=timedelta(days=14),
+)
+
+
+class ProxyAwareSessionInterface(SecureCookieSessionInterface):
+    def get_cookie_secure(self, app):
+        via_proxy = request.headers.get("X-Forwarded-For") or request.headers.get("CF-Connecting-IP")
+        proto_proxy = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+        return (super().get_cookie_secure(app) or request.is_secure
+                or bool(via_proxy and proto_proxy == "https"))
+
+
+app.session_interface = ProxyAwareSessionInterface()
+
+# Journal des erreurs : fichier journal_erreurs.log à côté de l'application (taille limitée)
+log = logging.getLogger("livraisons")
+log.setLevel(logging.INFO)
+_fichier_log = RotatingFileHandler(os.path.join(DONNEES, "journal_erreurs.log"), maxBytes=500_000,
+                                   backupCount=3, encoding="utf-8")
+_fichier_log.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+log.addHandler(_fichier_log)
+
+# (clé, libellé, type, options)
+CHAMPS = [
+    ("canal", "Canal de la commande", "select", ["WhatsApp", "Appel", "En personne"]),
+    ("client_nom", "Nom du client", "text", None),
+    ("client_tel", "Téléphone du client", "text", None),
+    ("collecte_lieu", "Lieu de collecte", "text", None),
+    ("collecte_quartier", "Quartier de collecte", "text", None),
+    ("livraison_adresse", "Adresse / repère de livraison", "text", None),
+    ("livraison_quartier", "Quartier de livraison", "text", None),
+    ("destinataire_nom", "Nom du destinataire", "text", None),
+    ("destinataire_tel", "Téléphone du destinataire", "text", None),
+    ("colis", "Description du colis", "text", None),
+    ("valeur_produit", "Valeur du produit (FCFA)", "number", None),
+    ("prix_course", "Prix de la course (FCFA)", "number", None),
+    ("mode_paiement", "Mode de paiement", "select", ["Espèces", "Orange Money", "Mobi Cash"]),
+    ("encaisse_course_prevu", "Qui encaisse le prix de la course ?", "select", ["À préciser", "Livreur", "Notre équipe"]),
+    ("statut_paiement", "Statut du paiement", "select", ["en attente", "payé", "crédit"]),
+    ("frais", "Frais engagés (carburant, etc.)", "number", None),
+    ("distance_km", "Distance (km)", "number", None),
+    ("statut", "Statut de la livraison", "select",
+     ["en attente", "collecté", "livré", "annulé", "injoignable", "reporté"]),
+    ("remarques", "Remarques / problèmes", "textarea", None),
+]
+CHAMPS[10:10] = [
+    ("categorie", "Catégorie du produit", "select",
+     ["", "Alimentation", "Médicaments / pharmacie", "Vêtements", "Électronique", "Documents",
+      "Boissons", "Cosmétiques", "Quincaillerie", "Autre"]),
+    ("produit", "Produit précis (ex : poulet, paracétamol)", "text", None),
+    ("quantite", "Quantité", "number", None),
+]
+CHAMPS[3:3] = [
+    ("type_client", "Type de client", "select",
+     ["", "Particulier", "Commerçant", "Restaurant", "Pharmacie", "Entreprise", "Autre"]),
+    ("client_quartier", "Quartier de résidence du client", "text", None),
+    ("source_client", "Comment le client nous a connus", "select",
+     ["", "Bouche-à-oreille", "WhatsApp", "Flyer", "Réseaux sociaux", "Autre"]),
+]
+CHAMPS.insert([c[0] for c in CHAMPS].index("remarques"), ("livreur", "Livreur assigné", "select", [""]))
+CLES = [c[0] for c in CHAMPS]
+NOMBRES = {"valeur_produit", "prix_course", "frais", "distance_km", "quantite"}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS livraisons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  numero TEXT,
+  cree_le TEXT,
+  canal TEXT, client_nom TEXT, client_tel TEXT,
+  collecte_lieu TEXT, collecte_quartier TEXT,
+  livraison_adresse TEXT, livraison_quartier TEXT,
+  destinataire_nom TEXT, destinataire_tel TEXT,
+  colis TEXT, valeur_produit REAL DEFAULT 0,
+  prix_course REAL DEFAULT 0, mode_paiement TEXT,
+  statut_paiement TEXT DEFAULT 'en attente',
+  frais REAL DEFAULT 0, distance_km REAL,
+  statut TEXT DEFAULT 'en attente',
+  heure_collecte TEXT, heure_livraison TEXT, heure_paiement TEXT,
+  remarques TEXT, message_original TEXT
+);
+"""
+
+
+def db():
+    con = sqlite3.connect(DB, timeout=30)  # attend jusqu'à 30 s si la base est occupée
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    with db() as con:
+        con.executescript(SCHEMA + EXTRA)
+        migrer(con)
+        seed_livreurs(con)
+        migrer_wa(con)
+
+
+def maintenant():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def nombre(valeur):
+    try:
+        return float(str(valeur).replace(" ", "").replace(",", "."))
+    except (ValueError, TypeError):
+        return 0 if valeur in ("", None) else None
+
+
+def lire_formulaire():
+    donnees = {}
+    for cle in CLES:
+        v = request.form.get(cle, "").strip()
+        if cle in NOMBRES:
+            donnees[cle] = nombre(v) if v else (None if cle == "distance_km" else 0)
+        else:
+            donnees[cle] = v
+    donnees["message_original"] = request.form.get("message_original", "")
+    for t in ("client_tel", "destinataire_tel"):  # numéros sans espaces : un client = un numéro
+        donnees[t] = chiffres(donnees[t])
+    return donnees
+
+
+# ---------------------------------------------------------------- Claude
+PROMPT_SYSTEME = (
+    "Tu extrais les informations d'une commande de livraison à moto à Ouagadougou "
+    "(Burkina Faso) depuis un message client. Le message peut être en français, "
+    "avec du mooré ou du dioula. Réponds UNIQUEMENT par un objet JSON, sans texte "
+    "autour, avec exactement ces clés : "
+    + ", ".join(CLES)
+    + ". Règles : encaisse_course_prevu parmi À préciser, Livreur, Notre équipe; ne devine pas qui encaisse. Valeur \"\" si l'information n'est pas dans le message, ne devine "
+    "jamais ; montants en FCFA, nombres sans espace ni symbole ; "
+    "canal = \"WhatsApp\" par défaut ; mode_paiement parmi Espèces, Orange Money, "
+    "Mobi Cash ; statut = \"en attente\" ; statut_paiement = \"en attente\" ; "
+    "garde les noms de quartiers et de lieux tels qu'écrits par le client. "
+    "categorie parmi : Alimentation, Médicaments / pharmacie, Vêtements, Électronique, Documents, "
+    "Boissons, Cosmétiques, Quincaillerie, Autre ; produit = le produit principal demandé "
+    "(ex. poulet, paracétamol) ; quantite = nombre d'unités ; type_client parmi Particulier, "
+    "Commerçant, Restaurant, Pharmacie, Entreprise, Autre (seulement si c'est évident) ; "
+    "source_client et client_quartier : vide sauf si le message le dit. livreur : toujours vide."
+)
+
+
+def extraire_avec_claude(message):
+    import anthropic  # importé ici pour que l'app démarre même sans la bibliothèque
+
+    client = anthropic.Anthropic()  # lit la variable ANTHROPIC_API_KEY
+    rep = client.messages.create(
+        model=MODELE,
+        max_tokens=800,
+        system=PROMPT_SYSTEME,
+        messages=[{"role": "user", "content": message}],
+    )
+    texte = "".join(b.text for b in rep.content if getattr(b, "type", "") == "text")
+    debut, fin = texte.find("{"), texte.rfind("}")
+    if debut == -1 or fin == -1:
+        raise ValueError("Réponse de Claude illisible")
+    brut = json.loads(texte[debut:fin + 1])
+    return {k: ("" if brut.get(k) is None else brut.get(k)) for k in CLES}
+
+
+# ---------------------------------------------------------------- Pages
+BASE = """
+<!doctype html>
+<html lang="fr"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b7a3b">
+<title>LIR · Gestion</title>
+<style>
+:root{--bg:#f3f6f4;--card:#fff;--txt:#0f1b14;--mut:#667a6e;--vert:#0b7a3b;--vert2:#13a355;--rouge:#d64545;--ambre:#f0a500;--bord:#e4eae6;
+--soft:rgba(11,122,59,.08);--ombre:0 1px 2px rgba(15,40,25,.05),0 10px 28px rgba(15,40,25,.06);--side:#0c1f15;--side-txt:#c9dacf;--r:14px}
+@media(prefers-color-scheme:dark){:root{--bg:#0a110d;--card:#141f19;--txt:#e8f0ea;--mut:#8da296;--bord:#22312a;--soft:rgba(46,204,113,.1);--ombre:none;--side:#07110b}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);line-height:1.45}
+a{color:var(--vert)}
+.app{display:grid;grid-template-columns:262px minmax(0,1fr);min-height:100vh}
+.side{background:var(--side);color:var(--side-txt);padding:18px 14px 20px;position:sticky;top:0;height:100vh;overflow-y:auto;display:flex;flex-direction:column;gap:2px}
+.logo{display:flex;align-items:center;gap:11px;color:#fff;text-decoration:none;padding:4px 8px 14px}
+.logo-i{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,var(--vert2),var(--vert));display:grid;place-items:center;font-size:1.35rem;box-shadow:0 6px 16px rgba(19,163,85,.35)}
+.logo b{display:block;font-size:1.08rem;letter-spacing:.4px}.logo small{color:#86a894;font-size:.72rem}
+.rech{padding:0 4px 4px}.rech input{width:100%;padding:9px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.06);color:#fff;font-size:.88rem}
+.rech input::placeholder{color:#86a894}.rech input:focus{outline:2px solid var(--vert2);border-color:transparent}
+.grp{font-size:.66rem;text-transform:uppercase;letter-spacing:.1em;color:#6b8978;margin:16px 10px 6px;font-weight:700}
+.side a.l{display:flex;align-items:center;gap:10px;color:var(--side-txt);text-decoration:none;padding:8px 10px;border-radius:11px;font-size:.92rem;font-weight:550}
+.side a.l i,.feuille a i{font-style:normal;width:28px;height:28px;border-radius:9px;background:rgba(255,255,255,.07);display:grid;place-items:center;font-size:.95rem;flex:none}
+.side a.l:hover{background:rgba(255,255,255,.07)}
+.side a.l.on{background:rgba(19,163,85,.2);color:#fff}.side a.l.on i{background:var(--vert2)}
+.side .bas-lien{margin-top:auto;padding-top:14px}
+.side .boutique-lien{display:flex;justify-content:space-between;align-items:center;gap:8px;background:linear-gradient(135deg,var(--vert2),var(--vert));color:#fff;text-decoration:none;padding:11px 14px;border-radius:12px;font-weight:650;font-size:.9rem}
+.contenu{min-width:0}
+main{max-width:1140px;margin:0 auto;padding:28px 26px 70px}
+.outil-app{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 16px}.outil-app .btn{padding:7px 12px;font-size:.8rem}.outil-app .sep{flex:1}
+.haut,.bas{display:none}
+.entete{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;flex-wrap:wrap;margin:0 0 20px}
+.entete h1{margin:0;font-size:1.65rem;letter-spacing:-.02em;line-height:1.15}.entete p{margin:5px 0 0;color:var(--mut);max-width:62ch}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.card{background:var(--card);border:1px solid var(--bord);border-radius:var(--r);padding:18px;margin-bottom:18px;box-shadow:var(--ombre)}
+h2{margin:0 0 14px;font-size:1.02rem;font-weight:700;letter-spacing:-.01em}h3{margin:16px 0 8px;font-size:.95rem}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.stat{background:var(--card);border:1px solid var(--bord);border-radius:12px;padding:14px 16px 14px 18px;position:relative;overflow:hidden}
+.stat:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--vert2)}
+.stat.ambre:before{background:var(--ambre)}.stat.rouge:before{background:var(--rouge)}
+.stat b{display:block;font-size:1.5rem;letter-spacing:-.02em;line-height:1.2}.stat span{color:var(--mut);font-size:.82rem}
+label{display:block;font-size:.8rem;color:var(--mut);margin:12px 0 5px;font-weight:650}
+input,select,textarea{width:100%;padding:10px 12px;border:1px solid var(--bord);border-radius:10px;font-size:.98rem;font-family:inherit;background:var(--card);color:var(--txt)}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--vert2);border-color:transparent}
+input[type=checkbox]{width:auto}
+button,.btn{background:linear-gradient(135deg,var(--vert2),var(--vert));color:#fff;border:0;border-radius:999px;padding:9px 17px;font-size:.9rem;font-weight:650;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:6px;font-family:inherit;box-shadow:0 3px 10px rgba(11,122,59,.22)}
+button:hover,.btn:hover{filter:brightness(1.07)}
+button.sec,.btn.sec{background:transparent;color:var(--vert);border:1px solid var(--vert);box-shadow:none}
+button.danger{background:transparent;color:var(--rouge);border:1px solid var(--rouge);box-shadow:none}
+.grille{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:0 16px}
+table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{padding:11px 8px;border-bottom:1px solid var(--bord);text-align:left;vertical-align:top}
+th{color:var(--mut);font-weight:650;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em}
+tbody tr:hover td,table tr:hover td{background:var(--soft)}
+.scroll{overflow-x:auto}.chart{position:relative;height:260px}
+.tag{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.74rem;font-weight:650;background:var(--soft);color:var(--mut)}
+.livré,.payé{background:rgba(11,122,59,.15);color:var(--vert)}.annulé,.injoignable{background:rgba(214,69,69,.15);color:var(--rouge)}.collecté{background:rgba(240,165,0,.18);color:#b07800}
+.ligne{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--bord)}
+.ligne:last-child{border-bottom:0}
+form.inline{display:inline}.mut{color:var(--mut);font-size:.86rem}
+.msg{display:inline-block;margin-top:4px}.msg summary{list-style:none;cursor:pointer}.msg summary::-webkit-details-marker{display:none}
+.msg .menu{display:flex;flex-direction:column;gap:2px;margin-top:6px}.msg .menu a{padding:7px 10px;border-radius:8px;text-decoration:none;white-space:nowrap;background:var(--soft)}.msg .menu a:hover{filter:brightness(.95)}
+.barre{height:14px;background:var(--soft);border-radius:999px;overflow:hidden;margin:6px 0}.barre>div{height:100%;background:linear-gradient(90deg,var(--vert),var(--vert2));border-radius:999px}
+.vide{text-align:center;color:var(--mut);padding:28px 10px}
+.pastille{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;background:var(--soft);font-size:.78rem;font-weight:650;color:var(--vert)}
+.pastille.ambre{background:rgba(240,165,0,.16);color:#a87400}.pastille.rouge{background:rgba(214,69,69,.14);color:var(--rouge)}
+code{background:var(--soft);padding:2px 6px;border-radius:6px;font-size:.85em}
+@media(max-width:900px){
+ .app{display:block}.side{display:none}
+ .haut{display:flex;align-items:center;justify-content:space-between;gap:10px;position:sticky;top:0;z-index:20;background:linear-gradient(135deg,#0b7a3b,#07521f);padding:calc(10px + env(safe-area-inset-top,0px)) 14px 10px;color:#fff}
+ .haut a{color:#fff;text-decoration:none;font-weight:800}.haut form{flex:1;max-width:260px}.haut input{padding:8px 12px;border-radius:999px;border:0;font-size:.9rem}
+ main{padding:16px 12px 100px}
+ .bas{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:30;background:var(--card);border-top:1px solid var(--bord);padding:6px 6px calc(6px + env(safe-area-inset-bottom,0px));box-shadow:0 -6px 20px rgba(0,0,0,.08)}
+ .bas>a,.bas summary{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:.68rem;color:var(--mut);text-decoration:none;padding:5px 2px;border-radius:10px;list-style:none;cursor:pointer;font-weight:600}
+ .bas summary::-webkit-details-marker{display:none}.bas>a i,.bas summary i{font-style:normal;font-size:1.25rem}.bas>a.on{color:var(--vert);background:var(--soft)}
+ .bas details{flex:1;display:flex}.bas details>summary{width:100%}
+ .feuille{position:fixed;left:10px;right:10px;bottom:calc(68px + env(safe-area-inset-bottom,0px));max-height:68vh;overflow-y:auto;background:var(--card);border:1px solid var(--bord);border-radius:18px;padding:10px;box-shadow:0 14px 40px rgba(0,0,0,.25);z-index:40}
+ .feuille a{display:flex;align-items:center;gap:10px;padding:10px;color:var(--txt);text-decoration:none;border-radius:10px;font-weight:600}.feuille a i{background:var(--soft)}
+ .feuille .g{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--mut);margin:10px 10px 2px;font-weight:700}
+ .entete h1{font-size:1.35rem}.card{padding:14px}.stats{grid-template-columns:repeat(2,1fr);gap:10px}.stat b{font-size:1.25rem}
+}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script></head><body>
+{% macro nav_lien(ep, icone, texte, aussi=[]) %}<a class="l {{ 'on' if request.endpoint == ep or request.endpoint in aussi }}" href="{{ url_for(ep) }}"><i>{{ icone }}</i>{{ texte }}</a>{% endmacro %}
+<div class="app">
+<aside class="side">
+<a class="logo" href="{{ url_for('accueil') }}"><span class="logo-i">🏍️</span><span><b>LIR</b><small>Livraison &amp; marché</small></span></a>
+<form method="get" action="{{ url_for('recherche') }}" class="rech"><input name="q" placeholder="🔍 Nom, numéro, produit…" required></form>
+{{ nav_lien('accueil', '☀️', "Livraisons du jour") }}
+{{ nav_lien('carte_direct', '🗺️', 'Carte en direct') }}
+{{ nav_lien('tableau_complet', '📊', 'Tableau de bord') }}
+<div class="grp">Exploitation</div>
+{{ nav_lien('nouvelle', '➕', 'Nouvelle livraison') }}
+{{ nav_lien('toutes', '📦', 'Livraisons') }}
+{{ nav_lien('clients', '👥', 'Clients') }}
+{{ nav_lien('livreurs', '🏍️', 'Livreurs') }}
+<div class="grp">Commerce</div>
+{{ nav_lien('partenaires', '🏪', 'Partenaires', ['partenaire']) }}
+{{ nav_lien('rayons', '🗂️', 'Rayons') }}
+{{ nav_lien('commande_catalogue', '🛒', 'Prendre commande') }}
+{{ nav_lien('revenus', '💰', 'Revenus') }}
+{{ nav_lien('caisse', '🧾', 'Caisse') }}
+<div class="grp">Pilotage</div>
+{{ nav_lien('marche', '🎯', 'Étude de marché') }}
+{{ nav_lien('stats', '📈', 'Statistiques') }}
+{{ nav_lien('semaine', '🗓️', 'Semaine') }}
+{{ nav_lien('export', '⬇️', 'Export CSV') }}
+<div class="grp">Système</div>
+{{ nav_lien('whatsapp', '🤖', 'WhatsApp') }}
+{{ nav_lien('sauvegardes', '💾', 'Sauvegardes') }}
+{{ nav_lien('parametres', '⚙️', 'Paramètres') }}
+<div class="bas-lien"><a class="boutique-lien" href="{{ url_for('boutique') }}" target="_blank"><span>🛍️ Voir la boutique</span><span>↗</span></a></div>
+</aside>
+<div class="contenu">
+<div class="haut"><a href="{{ url_for('accueil') }}">🏍️ LIR</a><form method="get" action="{{ url_for('recherche') }}"><input name="q" placeholder="🔍 Rechercher" required></form></div>
+<main><div class="outil-app"><a class="btn sec" href="{{ url_for('accueil') }}" onclick="return retourInterne(event,this)">← Retour</a><span class="sep"></span><a class="btn sec" href="{{ url_for('accueil') }}">🏠 Accueil</a><a class="btn sec" href="{{ url_for('parametres') }}">⚙️ Paramètres</a></div>{% block corps %}{% endblock %}</main>
+</div>
+</div>
+<nav class="bas">
+<a class="{{ 'on' if request.endpoint == 'accueil' }}" href="{{ url_for('accueil') }}"><i>☀️</i>Aujourd'hui</a>
+<a class="{{ 'on' if request.endpoint == 'nouvelle' }}" href="{{ url_for('nouvelle') }}"><i>➕</i>Nouvelle</a>
+<a class="{{ 'on' if request.endpoint == 'toutes' }}" href="{{ url_for('toutes') }}"><i>📦</i>Livraisons</a>
+<a class="{{ 'on' if request.endpoint in ('partenaires', 'partenaire') }}" href="{{ url_for('partenaires') }}"><i>🏪</i>Partenaires</a>
+<details><summary><i>☰</i>Plus</summary><div class="feuille">
+<div class="g">Exploitation</div>
+<a href="{{ url_for('carte_direct') }}"><i>🗺️</i>Carte en direct</a><a href="{{ url_for('tableau_complet') }}"><i>📊</i>Tableau de bord</a>
+<a href="{{ url_for('clients') }}"><i>👥</i>Clients</a><a href="{{ url_for('livreurs') }}"><i>🏍️</i>Livreurs</a>
+<div class="g">Commerce</div>
+<a href="{{ url_for('rayons') }}"><i>🗂️</i>Rayons</a><a href="{{ url_for('commande_catalogue') }}"><i>🛒</i>Prendre une commande</a><a href="{{ url_for('revenus') }}"><i>💰</i>Revenus</a><a href="{{ url_for('caisse') }}"><i>🧾</i>Caisse</a><a href="{{ url_for('boutique') }}" target="_blank"><i>🛍️</i>Voir la boutique</a>
+<div class="g">Pilotage</div>
+<a href="{{ url_for('marche') }}"><i>🎯</i>Étude de marché</a><a href="{{ url_for('stats') }}"><i>📈</i>Statistiques</a><a href="{{ url_for('semaine') }}"><i>🗓️</i>Semaine</a><a href="{{ url_for('export') }}"><i>⬇️</i>Export CSV</a>
+<div class="g">Système</div>
+<a href="{{ url_for('whatsapp') }}"><i>🤖</i>WhatsApp</a><a href="{{ url_for('sauvegardes') }}"><i>💾</i>Sauvegardes</a><a href="{{ url_for('parametres') }}"><i>⚙️</i>Paramètres</a>
+</div></details>
+</nav>
+<script>function retourInterne(e,a){try{const u=new URL(document.referrer);if(u.origin===location.origin&&history.length>1){e.preventDefault();history.back();return false;}}catch(_){}return true;}</script>
+</body></html>
+"""
+
+PAGE_ACCUEIL = BASE.replace("{% block corps %}{% endblock %}", """
+<style>
+.dash-head{display:flex;justify-content:space-between;align-items:center;gap:18px;flex-wrap:wrap;padding:25px 26px;margin-bottom:17px;border:1px solid rgba(19,163,85,.18);border-radius:20px;background:radial-gradient(ellipse at 90% 0%,rgba(19,163,85,.15),transparent 42%),linear-gradient(135deg,var(--card),var(--soft));box-shadow:var(--ombre)}
+.dash-head h1{font-size:1.8rem;line-height:1.15;letter-spacing:-.035em;margin:0}.dash-head p{margin:7px 0 0;color:var(--mut)}
+.dash-date{display:inline-flex;align-items:center;gap:7px;color:var(--vert);font-weight:700;font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:9px}
+.dash-actions{display:flex;gap:9px;flex-wrap:wrap}.dash-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.dash-box{margin:0;background:var(--card);border:1px solid var(--bord);border-radius:16px;box-shadow:var(--ombre);overflow:hidden;transition:border-color .18s,transform .18s,box-shadow .18s}
+.dash-box:hover{border-color:rgba(19,163,85,.48);transform:translateY(-1px)}.dash-box[open]{border-color:rgba(19,163,85,.55)}
+.dash-box>summary{display:grid;grid-template-columns:44px minmax(0,1fr) auto;align-items:center;gap:12px;min-height:82px;padding:15px 17px;cursor:pointer;list-style:none;user-select:none}
+.dash-box>summary::-webkit-details-marker{display:none}.dash-box>summary:focus-visible{outline:3px solid var(--vert2);outline-offset:-3px;border-radius:14px}
+.dash-ico{height:44px;width:44px;border-radius:14px;display:grid;place-items:center;font-size:1.2rem;background:var(--soft)}
+.dash-copy{min-width:0}.dash-copy b{display:block;font-size:.98rem;line-height:1.25}.dash-copy small{display:block;color:var(--mut);font-size:.8rem;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dash-side{display:flex;align-items:center;gap:9px}.dash-count{font-weight:750;color:var(--vert);white-space:nowrap;font-size:.9rem}.dash-chevron{width:28px;height:28px;display:grid;place-items:center;border-radius:50%;background:var(--soft);color:var(--vert);transition:transform .2s}.dash-box[open] .dash-chevron{transform:rotate(180deg)}
+.dash-body{padding:0 17px 17px;border-top:1px solid var(--bord)}.dash-body h2{margin:15px 0 10px}.dash-box.warn{border-color:rgba(240,165,0,.45)}.dash-box.warn .dash-ico{background:rgba(240,165,0,.15)}.dash-box.warn .dash-count{color:#a87400}
+.dash-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;padding-top:14px}.dash-kpi{padding:12px;border:1px solid var(--bord);border-radius:12px;background:var(--bg);min-width:0}.dash-kpi b{display:block;font-size:1.08rem;letter-spacing:-.02em;overflow-wrap:anywhere}.dash-kpi span{display:block;margin-top:3px;color:var(--mut);font-size:.76rem}
+.dash-table{width:100%;border-collapse:collapse}.dash-table td{padding:9px 7px;border-bottom:1px solid var(--bord)}.dash-table tr:last-child td{border-bottom:0}
+.dash-chart{position:relative;height:250px;margin-top:12px}.dash-body .barre{margin-top:15px}
+@media(max-width:900px){.dash-head{padding:19px 17px;border-radius:16px}.dash-head h1{font-size:1.5rem}.dash-grid{grid-template-columns:1fr;gap:11px}.dash-box>summary{min-height:74px;padding:13px}.dash-body{padding:0 13px 14px}.dash-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style>
+
+<header class="dash-head"><div><span class="dash-date">📍 Ouagadougou · Tableau de bord</span><h1>Bonjour, bienvenue 👋</h1><p>Un aperçu clair de ton activité. Ouvre un bloc pour voir ses détails.</p></div>
+<div class="dash-actions"><a class="btn" href="{{ url_for('nouvelle') }}">＋ Nouvelle livraison</a><a class="btn sec" href="{{ url_for('toutes') }}">Voir les livraisons</a></div></header>
+<div class="dash-grid">
+<details class="dash-box"><summary><span class="dash-ico">☀️</span><span class="dash-copy"><b>Activité du jour</b><small>{{ jour.n }} livraison{{ '' if jour.n == 1 else 's' }} · {{ jour.revenu|fcfa }} F de courses</small></span><span class="dash-side"><span class="dash-count">{{ jour.revenu|fcfa }} F</span><span class="dash-chevron">⌄</span></span></summary>
+<div class="dash-body"><div class="dash-kpis"><div class="dash-kpi"><b>{{ jour.n }}</b><span>livraisons</span></div><div class="dash-kpi"><b>{{ jour.revenu|fcfa }} F</b><span>courses</span></div><div class="dash-kpi"><b>{{ jour.frais|fcfa }} F</b><span>frais saisis</span></div><div class="dash-kpi"><b>{{ (jour.revenu - jour.frais)|fcfa }} F</b><span>solde indicatif</span></div></div></div></details>
+{% if alertes_total %}<details class="dash-box warn"><summary><span class="dash-ico">⚠️</span><span class="dash-copy"><b>Messages à vérifier</b><small>Des demandes nécessitent ton attention</small></span><span class="dash-side"><span class="dash-count">{{ alertes_total }}</span><span class="dash-chevron">⌄</span></span></summary>
+<div class="dash-body">{% for r in alertes %}<div class="ligne"><div><b>{{ r.numero }}</b> · {{ r.client_nom or r.client_tel }}<br><span class="mut">{{ etat_wa(r.auto_etat) }} : {{ r.auto_note }}</span></div><span><a class="btn sec" href="{{ url_for('modifier', id=r.id) }}">Ouvrir</a> <form class="inline" method="post" action="{{ url_for('traite_wa', id=r.id) }}"><button class="sec">Traité</button></form></span></div>{% endfor %}{% if alertes_total > alertes|length %}<p class="mut">Affichage des {{ alertes|length }} plus récentes sur {{ alertes_total }}. <a href="{{ url_for('whatsapp') }}">Voir le suivi WhatsApp</a></p>{% endif %}</div></details>{% endif %}
+<details class="dash-box"><summary><span class="dash-ico">🏍️</span><span class="dash-copy"><b>Livraisons à suivre</b><small>Commandes en cours ou à encaisser</small></span><span class="dash-side"><span class="dash-count">{{ en_cours_total }}</span><span class="dash-chevron">⌄</span></span></summary>
+<div class="dash-body">{% if en_cours %}{% include_rows %}{% if en_cours_total > en_cours|length %}<p class="mut">Affichage des {{ en_cours|length }} plus récentes sur {{ en_cours_total }}. <a href="{{ url_for('toutes') }}">Voir toutes les livraisons</a></p>{% endif %}{% else %}<p class="vide">Aucune livraison à suivre pour le moment.</p>{% endif %}</div></details>
+{% if obj.objectif %}<details class="dash-box"><summary><span class="dash-ico">🎯</span><span class="dash-copy"><b>Objectif de la semaine</b><small>{{ obj.rev|fcfa }} F réalisés sur {{ obj.objectif|fcfa }} F</small></span><span class="dash-side"><span class="dash-count">{{ obj.pct }} %</span><span class="dash-chevron">⌄</span></span></summary>
+<div class="dash-body"><div class="barre"><div style="width:{{ obj.pct }}%"></div></div><p class="mut">{% if obj.reste %}Encore {{ obj.reste|fcfa }} F pour atteindre l'objectif.{% else %}Objectif atteint 🎉{% endif %} · <a href="{{ url_for('semaine') }}">Voir le résumé de la semaine</a></p></div></details>{% endif %}
+<details class="dash-box"><summary><span class="dash-ico">💸</span><span class="dash-copy"><b>Créances à relancer</b><small>Montants dus sur les livraisons déjà terminées</small></span><span class="dash-side"><span class="dash-count">{{ impayes|fcfa }} F</span><span class="dash-chevron">⌄</span></span></summary>
+<div class="dash-body">{% for r in relances %}<div class="ligne"><div><b>{{ r.client_nom or r.client_tel or 'Client' }}</b><br><span class="mut">{{ r.numero }} · {{ r.jours }} j · {{ r.prix_course|fcfa }} F</span></div>{% if lien_relance(r) %}<a class="btn" target="_blank" href="{{ lien_relance(r) }}">Relancer</a>{% endif %}</div>{% else %}<p class="vide">Aucun impayé à relancer 👏</p>{% endfor %}{% if impayes_count > relances|length %}<p class="mut">Affichage des {{ relances|length }} créances les plus anciennes sur {{ impayes_count }}. <a href="{{ url_for('toutes') }}">Voir toutes les livraisons</a></p>{% endif %}</div></details>
+<details class="dash-box" data-graph="c7"><summary><span class="dash-ico">📈</span><span class="dash-copy"><b>Tendance sur 7 jours</b><small>Évolution des revenus et des frais</small></span><span class="dash-side"><span class="dash-count">Graphique</span><span class="dash-chevron">⌄</span></span></summary>
+<div class="dash-body"><div class="dash-chart"><canvas id="c7"></canvas></div></div></details>
+<details class="dash-box"><summary><span class="dash-ico">📦</span><span class="dash-copy"><b>Depuis le lancement</b><small>Volume et revenus cumulés</small></span><span class="dash-side"><span class="dash-count">{{ total.n }} courses</span><span class="dash-chevron">⌄</span></span></summary>
+<div class="dash-body"><div class="dash-kpis" style="grid-template-columns:repeat(3,minmax(0,1fr))"><div class="dash-kpi"><b>{{ total.n }}</b><span>livraisons</span></div><div class="dash-kpi"><b>{{ total.revenu|fcfa }} F</b><span>courses facturées</span></div><div class="dash-kpi"><b>{{ impayes|fcfa }} F</b><span>encore à encaisser</span></div></div></div></details>
+<details class="dash-box"><summary><span class="dash-ico">👥</span><span class="dash-copy"><b>Clients fidèles</b><small>Ceux qui commandent le plus</small></span><span class="dash-side"><span class="dash-count">Top 5</span><span class="dash-chevron">⌄</span></span></summary>
+<div class="dash-body"><table class="dash-table">{% for c in clients %}<tr><td><b>{{ c.client_nom }}</b></td><td>{{ c.n }} courses</td><td>{{ c.total|fcfa }} F</td></tr>{% else %}<tr><td class="mut">Pas encore de données.</td></tr>{% endfor %}</table></div></details>
+<details class="dash-box"><summary><span class="dash-ico">📍</span><span class="dash-copy"><b>Quartiers les plus livrés</b><small>Où se concentre ton activité</small></span><span class="dash-side"><span class="dash-count">Top 5</span><span class="dash-chevron">⌄</span></span></summary>
+<div class="dash-body"><table class="dash-table">{% for q in quartiers %}<tr><td><b>{{ q.livraison_quartier }}</b></td><td>{{ q.n }} courses</td><td>{{ q.total|fcfa }} F</td></tr>{% else %}<tr><td class="mut">Pas encore de données.</td></tr>{% endfor %}</table></div></details>
+</div>
+<script>
+(function(){const bloc=document.querySelector('[data-graph="c7"]');if(!bloc)return;const serie={{ serie|tojson }};let graphe=null;
+function dessiner(){if(!window.Chart||graphe)return;graphe=new Chart(document.getElementById('c7'),{type:'bar',data:{labels:serie.labels,datasets:[{label:'Revenus',data:serie.revenus,backgroundColor:'#0a7d3c',borderRadius:6},{label:'Bénéfice',data:serie.benefices,backgroundColor:'#9bd8b4',borderRadius:6}]},options:{maintainAspectRatio:false,responsive:true,plugins:{legend:{position:'bottom'}}}});}
+bloc.addEventListener('toggle',function(){if(bloc.open){if(graphe)graphe.resize();else dessiner();}});})();
+</script>
+""")
+
+LIGNES = """
+<div class="scroll"><table>
+<tr><th>N°</th><th>Client</th><th>Livraison</th><th>Prix</th><th>Statut</th><th>Actions</th></tr>
+{% for l in lignes %}<tr>
+ <td>{{ l.numero }}<br><span class="mut">{{ l.cree_le }}</span></td>
+ <td>{{ l.client_nom }}<br><span class="mut">{{ l.client_tel }}</span></td>
+ <td>{{ l.livraison_quartier }}<br><span class="mut">{{ l.livraison_adresse }}</span></td>
+ <td>{{ '{:,.0f}'.format(l.prix_course or 0).replace(',', ' ') }} F<br><span class="mut">{{ l.mode_paiement }}</span></td>
+ <td><span class="tag {{ l.statut }}">{{ l.statut }}</span><br><span class="tag {{ l.statut_paiement }}">{{ l.statut_paiement }}</span>{% if l.livreur %}<br><span class="mut">🏍️ {{ l.livreur }}</span>{% endif %}</td>
+ <td>
+  {% if l.statut == 'en attente' %}<form class="inline" method="post" action="{{ url_for('action', id=l.id, quoi='collecte') }}"><button>Collecté</button></form>{% endif %}
+  {% if l.statut in ('en attente','collecté') %}<form class="inline" method="post" action="{{ url_for('action', id=l.id, quoi='livre') }}"><button>Livré</button></form>{% endif %}
+  {% if l.statut_paiement != 'payé' and l.statut != 'annulé' %}<form class="inline" method="post" action="{{ url_for('action', id=l.id, quoi='paye') }}"><button class="sec">Payé</button></form>{% endif %}
+  <a class="btn sec" href="{{ url_for('modifier', id=l.id) }}">Modifier</a>
+  <a class="btn sec" href="{{ url_for('facture', id=l.id) }}">Facture</a>
+  {% set msgs = liens_messages(l) %}{% if msgs %}<details class="msg"><summary class="btn sec">💬 Message</summary><div class="menu">{% for lib, url in msgs %}<a href="{{ url }}" target="_blank">{{ lib }}</a>{% endfor %}</div></details>{% endif %}
+  {% if l.statut == 'annulé' %}<form class="inline" method="post" action="{{ url_for('supprimer_livraison', id=l.id, retour='client' if cle is defined else 'toutes', k=cle if cle is defined else '') }}" onsubmit="return confirm('Supprimer définitivement la livraison annulée {{ l.numero }} ? Cette action ne pourra pas être annulée.')"><button class="danger">Supprimer</button></form>{% endif %}
+ </td></tr>{% endfor %}
+</table></div>
+"""
+PAGE_ACCUEIL = PAGE_ACCUEIL.replace("{% include_rows %}", LIGNES.replace("lignes", "en_cours"))
+
+PAGE_TOUTES = BASE.replace("{% block corps %}{% endblock %}", """
+<style>
+.lv-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:17px}.lv-head h1{margin:0;font-size:1.7rem;letter-spacing:-.03em}.lv-head p{margin:5px 0 0;color:var(--mut)}
+.lv-filter{padding:15px 17px;margin-bottom:12px}.lv-form{display:grid;grid-template-columns:minmax(220px,2fr) repeat(3,minmax(145px,1fr)) auto auto;gap:9px;align-items:end}.lv-form label{margin:0}.lv-form input,.lv-form select{min-width:0}.lv-form button,.lv-form .btn{justify-content:center;white-space:nowrap}
+.lv-shortcuts{display:flex;gap:7px;flex-wrap:wrap;margin-top:13px}.lv-chip{display:inline-flex;align-items:center;gap:6px;padding:7px 11px;border-radius:999px;border:1px solid var(--bord);background:var(--bg);color:var(--mut);text-decoration:none;font-size:.82rem;font-weight:650}.lv-chip:hover,.lv-chip.on{border-color:var(--vert2);background:var(--soft);color:var(--vert)}
+.lv-meta{display:flex;justify-content:space-between;gap:10px;align-items:center;color:var(--mut);font-size:.85rem;padding:4px 2px 10px}.lv-list{display:grid;gap:11px}.lv-item{background:var(--card);border:1px solid var(--bord);border-radius:15px;padding:15px 17px;box-shadow:var(--ombre)}.lv-top,.lv-bottom{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.lv-id{font-size:1rem;font-weight:800;letter-spacing:.01em}.lv-tags{display:flex;gap:6px;flex-wrap:wrap}.lv-info{display:grid;grid-template-columns:1.05fr 1.4fr 1fr 1fr;gap:10px;margin:13px 0}.lv-cell{min-width:0;padding:10px 11px;border-radius:11px;background:var(--bg);border:1px solid var(--bord)}.lv-cell small{display:block;color:var(--mut);font-size:.67rem;font-weight:750;letter-spacing:.07em;text-transform:uppercase;margin-bottom:4px}.lv-cell b,.lv-cell span{display:block;overflow-wrap:anywhere}.lv-cell span{font-size:.84rem;color:var(--mut);margin-top:2px}.lv-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.lv-actions form{margin:0}.lv-actions .btn,.lv-actions button{font-size:.8rem;padding:7px 11px}.lv-pages{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:14px 0 65px}.lv-empty{text-align:center;padding:34px 15px}.lv-empty b{display:block;font-size:1.05rem;margin-bottom:5px}
+@media(max-width:950px){.lv-form{grid-template-columns:repeat(2,minmax(0,1fr))}.lv-form .lv-query{grid-column:1/-1}.lv-info{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:520px){.lv-head h1{font-size:1.45rem}.lv-head .btn{width:100%;justify-content:center}.lv-form{grid-template-columns:1fr 1fr;gap:8px}.lv-form .lv-query{grid-column:1/-1}.lv-item{padding:12px}.lv-info{gap:7px}.lv-cell{padding:9px}.lv-actions{width:100%}.lv-actions .btn,.lv-actions button{flex:1;justify-content:center}.lv-pages{margin-bottom:80px}}
+</style>
+<header class="lv-head"><div><h1>📦 Livraisons</h1><p>Retrouve une commande, filtre les statuts et traite les actions sans parcourir toute la liste.</p></div><a class="btn" href="{{ url_for('nouvelle', retour='toutes') }}">＋ Nouvelle livraison</a></header>
+{% if msg %}<div class="card"><span class="pastille {{ 'rouge' if erreur }}">{{ msg }}</span></div>{% endif %}
+<section class="card lv-filter"><form class="lv-form" method="get" action="{{ url_for('toutes') }}">
+<input type="hidden" name="vue" value="{{ vue }}">
+<label class="lv-query">🔎 Recherche<input type="search" name="q" value="{{ q }}" placeholder="N° commande, client, téléphone, quartier, colis…"></label>
+<label>Statut<select name="statut"><option value="">Tous les statuts</option>{% for s in statuts %}<option value="{{ s }}" {{ 'selected' if s == statut else '' }}>{{ s|capitalize }}</option>{% endfor %}</select></label>
+<label>Paiement<select name="paiement"><option value="">Tous les paiements</option>{% for s in paiements %}<option value="{{ s }}" {{ 'selected' if s == paiement else '' }}>{{ s|capitalize }}</option>{% endfor %}</select></label>
+<label>Livreur<select name="livreur"><option value="">Tous les livreurs</option>{% for nom in livreurs %}<option value="{{ nom }}" {{ 'selected' if nom == livreur else '' }}>{{ nom }}</option>{% endfor %}</select></label>
+<button type="submit">Rechercher</button><a class="btn sec" href="{{ url_for('toutes') }}">Effacer</a></form>
+<nav class="lv-shortcuts"><a class="lv-chip {{ 'on' if vue == 'tout' }}" href="{{ url_for('toutes', q=q, livreur=livreur) }}">Toutes</a><a class="lv-chip {{ 'on' if vue == 'actives' }}" href="{{ url_for('toutes', vue='actives', q=q, livreur=livreur) }}">🏍️ En cours</a><a class="lv-chip {{ 'on' if vue == 'impayees' }}" href="{{ url_for('toutes', vue='impayees', q=q, livreur=livreur) }}">💰 À encaisser</a><a class="lv-chip {{ 'on' if vue == 'livrees' }}" href="{{ url_for('toutes', vue='livrees', q=q, livreur=livreur) }}">✅ Livrées</a></nav></section>
+<div class="lv-meta"><span><b>{{ total }}</b> résultat{{ '' if total == 1 else 's' }}{% if q %} pour « {{ q }} »{% endif %}</span><span>Page {{ page }} / {{ pages }}</span></div>
+<div class="lv-list">
+{% for l in lignes %}<article class="lv-item"><div class="lv-top"><div><div class="lv-id">{{ l.numero or ('LIV-' ~ '%04d'|format(l.id)) }}</div><span class="mut">{{ l.cree_le or 'Date non renseignée' }}</span></div><div class="lv-tags"><span class="tag {{ l.statut }}">{{ l.statut }}</span><span class="tag {{ l.statut_paiement }}">{{ l.statut_paiement }}</span></div></div>
+<div class="lv-info"><div class="lv-cell"><small>Client</small><b>{{ l.client_nom or 'Client' }}</b><span>{{ l.client_tel or l.destinataire_tel or 'Téléphone non renseigné' }}</span></div>
+<div class="lv-cell"><small>Destination</small><b>{{ l.livraison_quartier or 'Quartier à préciser' }}</b><span>{{ l.livraison_adresse or 'Adresse à préciser' }}</span></div>
+<div class="lv-cell"><small>Colis / course</small><b>{{ l.colis or 'Livraison' }}</b><span>{{ l.prix_course|fcfa }} F · {{ l.mode_paiement or 'Paiement à préciser' }}</span></div>
+<div class="lv-cell"><small>Livreur</small><b>{{ l.livreur or 'Non assigné' }}</b><span>{% if l.collecte_quartier %}Collecte : {{ l.collecte_quartier }}{% else %}À assigner{% endif %}</span></div></div>
+<div class="lv-bottom"><span class="mut">{{ l.canal or 'Commande' }}{% if l.destinataire_nom %} · Destinataire : {{ l.destinataire_nom }}{% endif %}</span><div class="lv-actions">
+{% if l.statut == 'en attente' %}<form method="post" action="{{ url_for('action', id=l.id, quoi='collecte') }}"><button>Collecté</button></form>{% endif %}
+{% if l.statut in ('en attente','collecté') %}<form method="post" action="{{ url_for('action', id=l.id, quoi='livre') }}"><button>Livré</button></form>{% endif %}
+{% if l.statut_paiement != 'payé' and l.statut != 'annulé' %}<form method="post" action="{{ url_for('action', id=l.id, quoi='paye') }}"><button class="sec">Payé</button></form>{% endif %}
+<a class="btn sec" href="{{ url_for('modifier', id=l.id) }}">Modifier</a><a class="btn sec" href="{{ url_for('facture', id=l.id) }}">Facture</a>
+{% if l.statut == 'annulé' %}<form method="post" action="{{ url_for('supprimer_livraison', id=l.id) }}" onsubmit="return confirm('Supprimer définitivement cette livraison annulée ? Cette action ne pourra pas être annulée.')"><button class="danger">Supprimer</button></form>{% endif %}
+{% set msgs = liens_messages(l) %}{% if msgs %}<details class="msg"><summary class="btn sec">💬 Message</summary><div class="menu">{% for lib, url in msgs %}<a href="{{ url }}" target="_blank">{{ lib }}</a>{% endfor %}</div></details>{% endif %}</div></div></article>
+{% else %}<div class="card lv-empty"><b>Aucune livraison trouvée</b><span class="mut">Essaie un autre nom, numéro, quartier ou filtre.</span><p><a class="btn" href="{{ url_for('nouvelle', retour='toutes') }}">＋ Créer une nouvelle livraison</a></p></div>{% endfor %}
+</div>
+{% if pages > 1 %}<nav class="lv-pages">{% if page > 1 %}<a class="btn sec" href="{{ url_for('toutes', q=q, statut=statut, paiement=paiement, livreur=livreur, vue=vue, page=page-1) }}">← Précédent</a>{% else %}<span></span>{% endif %}<span class="mut">Page {{ page }} sur {{ pages }}</span>{% if page < pages %}<a class="btn sec" href="{{ url_for('toutes', q=q, statut=statut, paiement=paiement, livreur=livreur, vue=vue, page=page+1) }}">Suivant →</a>{% endif %}</nav>{% endif %}
+""")
+
+PAGE_FORM = BASE.replace("{% block corps %}{% endblock %}", """
+{% if analyse %}
+<div class="card"><h2>1. Colle le message du client</h2>
+<textarea id="message" rows="5" placeholder="Colle ici le message WhatsApp (texte ou transcription d'une note vocale)"></textarea>
+<p><button type="button" onclick="analyser()" id="btn">Analyser le message</button>
+<span id="etat" class="mut"></span></p></div>
+{% endif %}
+<form method="post" action="{{ cible }}" class="card">
+<h2>{{ titre }}</h2>
+<input type="hidden" name="message_original" id="message_original" value="{{ v.get('message_original','') }}">
+<div id="sugg"></div>
+<div class="grille">
+{% for cle, libelle, genre, options in champs %}<div>
+ <label for="{{ cle }}">{{ libelle }}</label>
+ {% if genre == 'select' %}<select id="{{ cle }}" name="{{ cle }}">
+  {% for o in options %}<option {{ 'selected' if v.get(cle) == o else '' }}>{{ o }}</option>{% endfor %}</select>
+ {% elif genre == 'textarea' %}<textarea id="{{ cle }}" name="{{ cle }}" rows="2">{{ v.get(cle) or '' }}</textarea>
+ {% elif genre == 'number' %}<input id="{{ cle }}" name="{{ cle }}" type="number" step="any" value="{{ v.get(cle) if v.get(cle) not in (None, 0, 0.0) else '' }}">
+ {% else %}<input id="{{ cle }}" name="{{ cle }}" value="{{ v.get(cle) or '' }}">{% endif %}
+</div>{% endfor %}</div>
+<p><button type="button" class="sec" onclick="distance()">📍 Calculer la distance</button> <span id="dist" class="mut"></span></p>
+<p><button type="button" class="sec" onclick="suggererLivreur()">🧭 Livreur le plus proche</button> <span id="sugl" class="mut"></span></p><div id="sugl_liste"></div>
+<p><button>Enregistrer</button></p></form>
+<script>
+async function suggererLivreur(){
+  const g=id=>(document.getElementById(id)||{}).value||'';
+  const a=[g('collecte_lieu'),g('collecte_quartier')].filter(Boolean).join(', ');
+  const el=document.getElementById('sugl');
+  if(!a){el.textContent=' Renseigne le lieu de collecte.';return;}
+  el.textContent=' Recherche…';
+  try{
+    const r=await fetch('{{ url_for("suggestion_livreur") }}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({a:a,qa:g('collecte_quartier')})});
+    const d=await r.json(); if(!r.ok) throw new Error(d.erreur||'Erreur');
+    const box=document.getElementById('sugl_liste'); box.innerHTML='';
+    d.livreurs.forEach((l,i)=>{
+      const b=document.createElement('button');b.type='button';b.className=i===0?'':'sec';b.style.margin='4px 6px 4px 0';
+      b.textContent=(i===0?'🏆 ':'')+l.nom+' · '+l.base+' · '+l.km+' km · '+l.en_cours+' en cours';
+      b.onclick=()=>{const s=document.getElementById('livreur');if(s)s.value=l.nom;};
+      box.appendChild(b);
+    });
+    const s=document.getElementById('livreur'); if(s) s.value=d.livreurs[0].nom;
+    el.textContent=' Proposé : '+d.livreurs[0].nom+(d.approx?' (collecte approximative)':'')+' · clique sur un autre nom pour changer';
+  }catch(e){el.textContent=' '+e.message;}
+}
+let tmr=null;
+function chercherClient(){
+  clearTimeout(tmr);
+  tmr=setTimeout(async()=>{
+    const a=document.activeElement;
+    const q=(a&&['client_nom','client_tel'].includes(a.id))?a.value.trim():'';
+    const box=document.getElementById('sugg');
+    if(q.length<2){box.innerHTML='';return;}
+    try{
+      const r=await fetch('{{ url_for("api_clients") }}?q='+encodeURIComponent(q));
+      const L=await r.json(); box.innerHTML='';
+      L.forEach(c=>{
+        const b=document.createElement('button');b.type='button';b.className='sec';b.style.margin='4px 6px 4px 0';
+        b.textContent='👤 '+(c.nom||c.tel)+' · '+c.tel+' · '+c.n+' course'+(c.n>1?'s':'')
+          +(c.livraison_quartier?' · dernière livraison : '+c.livraison_quartier:'')
+          +(c.impaye?' · '+c.impaye+' F à encaisser':'');
+        b.onclick=()=>{remplirClient(c,true);box.innerHTML='';};
+        box.appendChild(b);
+      });
+    }catch(e){}
+  },250);
+}
+function remplirClient(c,ecraser){
+  const infos=['client_nom','client_tel','type_client','client_quartier','source_client','mode_paiement'];
+  const m={client_nom:c.nom,client_tel:c.tel,type_client:c.type_client,client_quartier:c.client_quartier,source_client:c.source_client,mode_paiement:c.mode_paiement};
+  for(const [k,v] of Object.entries(m)){
+    const el=document.getElementById(k); if(!el||!v)continue;
+    if(el.value===''||(ecraser&&infos.includes(k))) el.value=v;
+  }
+}
+async function completerClient(){
+  const q=((document.getElementById('client_tel')||{}).value||(document.getElementById('client_nom')||{}).value||'').trim();
+  if(q.length<2)return;
+  try{
+    const r=await fetch('{{ url_for("api_clients") }}?q='+encodeURIComponent(q)); const L=await r.json();
+    if(L.length===1) remplirClient(L[0],false);
+  }catch(e){}
+}
+['client_nom','client_tel'].forEach(id=>{const e=document.getElementById(id); if(e) e.addEventListener('input',chercherClient);});
+async function distance(){
+  const g=id=>(document.getElementById(id)||{}).value||'';
+  const a=[g('collecte_lieu'),g('collecte_quartier')].filter(Boolean).join(', ');
+  const b=[g('livraison_adresse'),g('livraison_quartier')].filter(Boolean).join(', ');
+  const el=document.getElementById('dist');
+  if(!a||!b){el.textContent=' Renseigne la collecte et la livraison.';return;}
+  el.textContent=' Calcul en cours…';
+  try{
+    const r=await fetch('{{ url_for("route_distance") }}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({a:a,b:b,qa:g('collecte_quartier'),qb:g('livraison_quartier')})});
+    const d=await r.json(); if(!r.ok) throw new Error(d.erreur||'Erreur');
+    document.getElementById('distance_km').value=d.km;
+    el.textContent=' ≈ '+d.km+' km, environ '+d.minutes+' min'+(d.approx?' · position approximative (quartier)':'')+' · © OpenStreetMap';
+  }catch(e){el.textContent=' '+e.message;}
+}
+async function analyser(){
+  const msg=document.getElementById('message').value.trim(); if(!msg)return;
+  const etat=document.getElementById('etat'); etat.textContent=' Analyse en cours…';
+  try{
+    const r=await fetch('{{ url_for("extraire") }}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
+    const d=await r.json(); if(!r.ok) throw new Error(d.erreur||'Erreur');
+    for(const [k,val] of Object.entries(d)){const el=document.getElementById(k); if(el&&val!=='') el.value=val;}
+    document.getElementById('message_original').value=msg;
+    etat.textContent=' Vérifie les champs puis enregistre.';completerClient();distance();suggererLivreur();
+  }catch(e){etat.textContent=' '+e.message+' — tu peux remplir à la main.';}
+}
+</script>
+""")
+
+
+def formulaire(v, cible, titre, analyse):
+    return render_template_string(PAGE_FORM, v=v, cible=cible, titre=titre,
+                                  analyse=analyse, champs=champs_dynamiques())
+
+
+@app.route("/")
+def accueil():
+    debut_semaine = lundi(date.today()).isoformat()
+    with db() as con:
+        mesures = con.execute(
+            "SELECT "
+            "COUNT(CASE WHEN statut!='annulé' THEN 1 END) total_n, "
+            "COALESCE(SUM(CASE WHEN statut!='annulé' THEN COALESCE(prix_course,0) ELSE 0 END),0) total_revenu, "
+            "COUNT(CASE WHEN statut!='annulé' AND date(cree_le)=date('now','localtime') THEN 1 END) jour_n, "
+            "COALESCE(SUM(CASE WHEN statut!='annulé' AND date(cree_le)=date('now','localtime') THEN COALESCE(prix_course,0) ELSE 0 END),0) jour_revenu, "
+            "COALESCE(SUM(CASE WHEN statut!='annulé' AND date(cree_le)=date('now','localtime') THEN COALESCE(frais,0) ELSE 0 END),0) jour_frais, "
+            "COUNT(CASE WHEN statut='livré' AND statut_paiement!='payé' THEN 1 END) impayes_n, "
+            "COALESCE(SUM(CASE WHEN statut='livré' AND statut_paiement!='payé' THEN COALESCE(prix_course,0) ELSE 0 END),0) impayes, "
+            "COUNT(CASE WHEN statut IN ('en attente','collecté') OR (statut='livré' AND statut_paiement!='payé') THEN 1 END) suivi_n, "
+            "COUNT(CASE WHEN auto_etat IN ('a_verifier','erreur_envoi','a_completer') THEN 1 END) alertes_n, "
+            "COALESCE(SUM(CASE WHEN statut!='annulé' AND date(cree_le)>=? AND date(cree_le)<=date('now','localtime') THEN COALESCE(prix_course,0) ELSE 0 END),0) revenu_semaine "
+            "FROM livraisons", (debut_semaine,)).fetchone()
+        jour = {"n": mesures["jour_n"], "revenu": mesures["jour_revenu"], "frais": mesures["jour_frais"]}
+        total = {"n": mesures["total_n"], "revenu": mesures["total_revenu"]}
+        impayes = mesures["impayes"]
+        en_cours_total = mesures["suivi_n"]
+        alertes_total = mesures["alertes_n"]
+        en_cours = con.execute(
+            "SELECT * FROM livraisons WHERE statut IN ('en attente','collecté') "
+            "OR (statut='livré' AND statut_paiement!='payé') ORDER BY id DESC LIMIT ?", (12,)).fetchall()
+        alertes = a_traiter(limite=10, con=con)
+        relance_lignes = relances(limite=10, con=con)
+        clients = con.execute(
+            "SELECT client_nom, COUNT(*) n, COALESCE(SUM(prix_course),0) total FROM livraisons "
+            "WHERE client_nom!='' AND statut!='annulé' GROUP BY client_nom ORDER BY n DESC LIMIT 5").fetchall()
+        quartiers = con.execute(
+            "SELECT livraison_quartier, COUNT(*) n, COALESCE(SUM(prix_course),0) total FROM livraisons "
+            "WHERE livraison_quartier!='' AND statut!='annulé' GROUP BY livraison_quartier "
+            "ORDER BY n DESC LIMIT 5").fetchall()
+        objectif_row = con.execute("SELECT valeur FROM reglages WHERE cle='objectif_hebdo'").fetchone()
+        objectif = int((objectif_row["valeur"] if objectif_row else 0) or 0)
+        obj = {"objectif": 0}
+        if objectif:
+            rev = mesures["revenu_semaine"]
+            obj = {"objectif": objectif, "rev": rev,
+                   "pct": min(100, round(100 * rev / objectif)),
+                   "reste": max(0, objectif - rev)}
+        serie = serie_jours(7, con=con)
+    return render_template_string(PAGE_ACCUEIL, jour=jour, total=total, impayes=impayes,
+                                  impayes_count=mesures["impayes_n"], en_cours=en_cours,
+                                  en_cours_total=en_cours_total, alertes=alertes,
+                                  alertes_total=alertes_total, clients=clients, quartiers=quartiers,
+                                  relances=relance_lignes, obj=obj, serie=serie)
+
+
+@app.route("/toutes")
+def toutes():
+    q = request.args.get("q", "").strip()[:100]
+    statut = request.args.get("statut", "")
+    paiement = request.args.get("paiement", "")
+    livreur = request.args.get("livreur", "").strip()[:100]
+    vue = request.args.get("vue", "tout")
+    statuts = ("en attente", "collecté", "livré", "annulé", "injoignable", "reporté")
+    paiements = ("en attente", "payé", "crédit")
+    if statut not in statuts:
+        statut = ""
+    if paiement not in paiements:
+        paiement = ""
+    if vue not in ("tout", "actives", "impayees", "livrees"):
+        vue = "tout"
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except (TypeError, ValueError):
+        page = 1
+    taille_page = 20
+    conditions, params = [], []
+    if q:
+        champs = ("numero", "client_nom", "client_tel", "destinataire_nom", "destinataire_tel", "collecte_lieu",
+                  "collecte_quartier", "livraison_adresse", "livraison_quartier", "colis", "livreur", "remarques")
+        conditions.append("(" + " OR ".join(f"LOWER(COALESCE({col},'')) LIKE ?" for col in champs) + ")")
+        params.extend([f"%{q.lower()}%"] * len(champs))
+        chiffres_q = chiffres(q)
+        if len(chiffres_q) >= 3:
+            conditions.append("(REPLACE(REPLACE(COALESCE(client_tel,''),' ',''),'-','') LIKE ? "
+                              "OR REPLACE(REPLACE(COALESCE(destinataire_tel,''),' ',''),'-','') LIKE ?)")
+            params.extend([f"%{chiffres_q}%"] * 2)
+    if statut:
+        conditions.append("statut=?")
+        params.append(statut)
+    if paiement:
+        conditions.append("statut_paiement=?")
+        params.append(paiement)
+    if livreur:
+        conditions.append("livreur=?")
+        params.append(livreur)
+    if vue == "actives":
+        conditions.append("statut IN ('en attente','collecté')")
+    elif vue == "impayees":
+        conditions.append("statut_paiement!='payé' AND statut!='annulé'")
+    elif vue == "livrees":
+        conditions.append("statut='livré'")
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    with db() as con:
+        total = con.execute("SELECT COUNT(*) FROM livraisons" + where, params).fetchone()[0]
+        pages = max(1, (total + taille_page - 1) // taille_page)
+        page = min(page, pages)
+        offset = (page - 1) * taille_page
+        lignes = con.execute("SELECT * FROM livraisons" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                             params + [taille_page, offset]).fetchall()
+        livreurs = [r[0] for r in con.execute("SELECT DISTINCT livreur FROM livraisons WHERE COALESCE(TRIM(livreur),'')!='' ORDER BY livreur COLLATE NOCASE")]
+    return render_template_string(PAGE_TOUTES, lignes=lignes, q=q, statut=statut, paiement=paiement,
+                                  livreur=livreur, livreurs=livreurs, statuts=statuts, paiements=paiements,
+                                  vue=vue, total=total, page=page, pages=pages,
+                                  msg=request.args.get("msg", "")[:200], erreur=request.args.get("erreur", "") == "1")
+
+
+@app.route("/nouvelle", methods=["GET", "POST"])
+def nouvelle():
+    if request.method == "POST":
+        d = lire_formulaire()
+        colonnes = CLES + ["message_original", "cree_le"]
+        valeurs = [d[c] for c in CLES] + [d["message_original"], maintenant()]
+        with db() as con:
+            cur = con.execute(
+                f"INSERT INTO livraisons ({','.join(colonnes)}) VALUES ({','.join('?' * len(colonnes))})",
+                valeurs)
+            con.execute("UPDATE livraisons SET numero=? WHERE id=?",
+                        (f"LIV-{cur.lastrowid:04d}", cur.lastrowid))
+        retour = request.args.get("retour")
+        if retour == "toutes":
+            return redirect(url_for("toutes"))
+        if retour == "clients":
+            return redirect(url_for("clients", segment=request.args.get("segment", "tous"),
+                                    q=request.args.get("q", "")))
+        if retour == "client" and request.args.get("k"):
+            return redirect(url_for("client", k=request.args["k"]))
+        return redirect(url_for("accueil"))
+
+    client_cle = request.args.get("client", "")
+    v = {"statut": "en attente", "statut_paiement": "en attente", "encaisse_course_prevu": "À préciser"}
+    if client_cle:
+        with db() as con:
+            precedent = con.execute(
+                f"SELECT * FROM livraisons WHERE {CLE}=? AND statut!='annulé' ORDER BY id DESC LIMIT 1",
+                (client_cle,)).fetchone()
+        if precedent:
+            for cle in ("client_nom", "client_tel", "type_client", "client_quartier", "source_client", "mode_paiement"):
+                v[cle] = precedent[cle] or ""
+
+    retour = request.args.get("retour", "")
+    params = {}
+    if retour == "toutes":
+        params["retour"] = "toutes"
+    elif retour == "clients":
+        params.update(retour="clients", segment=request.args.get("segment", "tous"), q=request.args.get("q", ""))
+    elif retour == "client":
+        params.update(retour="client", k=request.args.get("k") or client_cle)
+    if client_cle:
+        params["client"] = client_cle
+    cible = url_for("nouvelle", **params)
+    return formulaire(v, cible, "Nouvelle livraison · vérifie et enregistre", True)
+
+
+@app.route("/modifier/<int:id>", methods=["GET", "POST"])
+def modifier(id):
+    if request.method == "POST":
+        d = lire_formulaire()
+        with db() as con:
+            con.execute(f"UPDATE livraisons SET {','.join(c + '=?' for c in CLES)} WHERE id=?",
+                        [d[c] for c in CLES] + [id])
+        return redirect(url_for("toutes"))
+    with db() as con:
+        ligne = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+    if not ligne:
+        return redirect(url_for("toutes"))
+    return formulaire(dict(ligne), url_for("modifier", id=id), f"Modifier {ligne['numero']}", False)
+
+
+@app.route("/livraisons/<int:id>/supprimer", methods=["POST"])
+def supprimer_livraison(id):
+    cle_retour = request.args.get("k", "")[:120]
+    retour_client = request.args.get("retour") == "client" and bool(cle_retour)
+    message, erreur = "Livraison supprimée.", False
+    with db() as con:
+        l = con.execute("SELECT id, numero, statut, statut_paiement, partenaire_id, valeur_produit, auto_etat "
+                        "FROM livraisons WHERE id=?", (id,)).fetchone()
+        if not l:
+            message, erreur = "Cette livraison n’existe plus.", True
+        elif l["statut"] != "annulé":
+            message, erreur = "Seules les livraisons annulées peuvent être supprimées définitivement.", True
+        else:
+            usages = (
+                con.execute("SELECT COUNT(*) FROM lignes_commande WHERE livraison_id=?", (id,)).fetchone()[0],
+                con.execute("SELECT COUNT(*) FROM avis WHERE livraison_id=?", (id,)).fetchone()[0],
+                con.execute("SELECT COUNT(*) FROM messages_wa WHERE livraison_id=?", (id,)).fetchone()[0],
+            )
+            if (l["partenaire_id"] or any(usages) or l["auto_etat"]
+                    or l["statut_paiement"] != "en attente" or (l["valeur_produit"] or 0)):
+                message = "Suppression bloquée : la livraison conserve un lien commercial, un paiement ou un historique."
+                erreur = True
+            else:
+                con.execute("DELETE FROM livraisons WHERE id=?", (id,))
+    if retour_client:
+        cible = url_for("client", k=cle_retour, msg=message, erreur=int(erreur))
+    else:
+        cible = url_for("toutes", msg=message, erreur=int(erreur))
+    return redirect(cible)
+
+
+@app.route("/action/<int:id>/<quoi>", methods=["POST"])
+def action(id, quoi):
+    requetes = {
+        "collecte": "UPDATE livraisons SET statut='collecté', heure_collecte=? WHERE id=?",
+        "livre": "UPDATE livraisons SET statut='livré', heure_livraison=? WHERE id=?",
+        "paye": "UPDATE livraisons SET statut_paiement='payé', heure_paiement=? WHERE id=?",
+    }
+    if quoi in requetes:
+        with db() as con:
+            con.execute(requetes[quoi], (maintenant(), id))
+        if quoi in ("collecte", "livre"):
+            notifier_client(id, quoi)
+    return redirect(request.referrer or url_for("accueil"))
+
+
+@app.route("/extraire", methods=["POST"])
+def extraire():
+    message = (request.get_json(silent=True) or {}).get("message", "").strip()
+    if not message:
+        return jsonify(erreur="Message vide"), 400
+    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")):
+        return jsonify(erreur="Aucune clé IA configurée (GEMINI_API_KEY ou ANTHROPIC_API_KEY)"), 500
+    try:
+        return jsonify(extraire_avec_ia(message))
+    except Exception as e:  # on renvoie l'erreur à l'écran au lieu de planter
+        return jsonify(erreur=f"Analyse impossible ({type(e).__name__} {getattr(e, 'code', '')})"), 500
+
+
+@app.route("/export.csv")
+def export():
+    with db() as con:
+        lignes = con.execute("SELECT * FROM livraisons ORDER BY id").fetchall()
+    sortie = io.StringIO()
+    if lignes:
+        w = csv.writer(sortie)
+        w.writerow(lignes[0].keys())
+        w.writerows([tuple(l) for l in lignes])
+    # BOM UTF-8 pour que Excel affiche bien les accents
+    return Response("\ufeff" + sortie.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=livraisons.csv"})
+
+
+# ===================== V2 : statistiques, clients, factures, relances =====================
+from datetime import timedelta
+from urllib.parse import quote, urlsplit
+
+ENTREPRISE = {  # modifie ces lignes : elles apparaissent sur les factures
+    "nom": "LIR - Livreur d'Intervention Rapide",
+    "responsable": "SANON Justin",
+    "tel": "07 60 66 77 / 55 28 82 36",
+    "ville": "Ouagadougou, Burkina Faso",
+}
+EXTRA = ("CREATE TABLE IF NOT EXISTS notes_clients (cle TEXT PRIMARY KEY, note TEXT);"
+         "CREATE TABLE IF NOT EXISTS geocache (cle TEXT PRIMARY KEY, lat REAL, lon REAL);"
+         "CREATE TABLE IF NOT EXISTS reglages (cle TEXT PRIMARY KEY, valeur TEXT);"
+         "CREATE TABLE IF NOT EXISTS livreurs (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, tel TEXT, base TEXT, actif INTEGER DEFAULT 1);"
+         "CREATE TABLE IF NOT EXISTS paiements_livreurs (id INTEGER PRIMARY KEY AUTOINCREMENT, livreur_id INTEGER, livreur_nom TEXT NOT NULL, montant INTEGER NOT NULL CHECK(montant > 0), moyen TEXT NOT NULL, note TEXT DEFAULT '', paye_le TEXT NOT NULL, cree_le TEXT NOT NULL);"
+         "CREATE TABLE IF NOT EXISTS messages_wa (id TEXT PRIMARY KEY, sens TEXT, tel TEXT, type TEXT, contenu TEXT, cree_le TEXT, livraison_id INTEGER, statut TEXT);")
+CLE = "COALESCE(NULLIF(client_tel,''), NULLIF(client_nom,''), 'inconnu')"
+
+
+def fcfa(v):
+    return "{:,.0f}".format(v or 0).replace(",", " ")
+
+
+def tel_wa(tel):
+    n = "".join(ch for ch in (tel or "") if ch.isdigit())
+    return "226" + n if len(n) == 8 else n
+
+
+def lien_relance(l):
+    n = tel_wa(l["client_tel"])
+    if not n:
+        return ""
+    txt = (f"Bonjour {l['client_nom'] or ''}, petit rappel : la course {l['numero']} du "
+           f"{(l['cree_le'] or '')[:10]} ({fcfa(l['prix_course'])} FCFA) n'est pas encore réglée. Merci ! - LIR")
+    return f"https://wa.me/{n}?text={quote(txt)}"
+
+
+app.jinja_env.filters["fcfa"] = fcfa
+app.jinja_env.globals["lien_relance"] = lien_relance
+
+
+def relances(limite=None, con=None):
+    sql = (
+        "SELECT *, CAST(julianday('now','localtime')-julianday(COALESCE(NULLIF(heure_livraison,''),cree_le)) AS INTEGER) AS jours "
+        "FROM livraisons WHERE statut='livré' AND statut_paiement!='payé' "
+        "ORDER BY COALESCE(NULLIF(heure_livraison,''),cree_le) ASC, id ASC")
+    params = []
+    if limite is not None:
+        try:
+            limite = max(1, min(100, int(limite)))
+        except (TypeError, ValueError):
+            limite = 10
+        sql += " LIMIT ?"
+        params.append(limite)
+    if con is not None:
+        return con.execute(sql, params).fetchall()
+    with db() as connexion:
+        return connexion.execute(sql, params).fetchall()
+
+
+def serie_jours(n, con=None):
+    debut = (datetime.now() - timedelta(days=n - 1)).strftime("%Y-%m-%d")
+    sql = (
+        "SELECT date(cree_le) j, SUM(prix_course) r, SUM(frais) f, COUNT(*) c FROM livraisons "
+        "WHERE statut!='annulé' AND date(cree_le)>=? GROUP BY j")
+    if con is None:
+        with db() as connexion:
+            rows = connexion.execute(sql, (debut,)).fetchall()
+    else:
+        rows = con.execute(sql, (debut,)).fetchall()
+    d = {r["j"]: r for r in rows}
+    jours = [datetime.now() - timedelta(days=n - 1 - i) for i in range(n)]
+    out = {"labels": [j.strftime("%d/%m") for j in jours], "revenus": [], "benefices": [], "courses": []}
+    for j in jours:
+        r = d.get(j.strftime("%Y-%m-%d"))
+        rev, fr = ((r["r"] or 0), (r["f"] or 0)) if r else (0, 0)
+        out["revenus"].append(rev)
+        out["benefices"].append(rev - fr)
+        out["courses"].append(r["c"] if r else 0)
+    return out
+
+
+PAGE_STATS = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="card"><h2>Indicateurs clés</h2><div class="stats">
+ <div class="stat"><b>{{ k.panier|fcfa }} F</b><span>Panier moyen</span></div>
+ <div class="stat"><b>{{ k.net|fcfa }} F</b><span>Bénéfice net total</span></div>
+ <div class="stat"><b>{{ k.par_course|fcfa }} F</b><span>Bénéfice par course</span></div>
+ <div class="stat"><b>{{ k.duree }}</b><span>Durée moyenne collecte → livraison</span></div>
+ <div class="stat"><b>{{ k.annul }} %</b><span>Annulées / injoignables</span></div>
+ <div class="stat"><b>{{ k.km }} km</b><span>Distance totale</span></div>
+</div></div>
+<div class="card"><h2>Revenus et bénéfice, 30 derniers jours</h2><div class="chart"><canvas id="g1"></canvas></div></div>
+<div class="grille">
+<div class="card"><h2>Quartiers les plus livrés</h2><div class="chart"><canvas id="g2"></canvas></div></div>
+<div class="card"><h2>Modes de paiement</h2><div class="chart"><canvas id="g3"></canvas></div></div>
+<div class="card"><h2>Heures de pointe</h2><div class="chart"><canvas id="g4"></canvas></div></div>
+<div class="card"><h2>Jours de la semaine</h2><div class="chart"><canvas id="g5"></canvas></div></div>
+</div>
+<script>
+const D={{ data|tojson }};const C=['#0a7d3c','#f2a900','#2d7ff9','#d64545','#8e5bd9','#16b3a5','#e86fa4','#7a8b83'];
+function mk(id,type,labels,sets,o){if(!window.Chart)return;new Chart(document.getElementById(id),{type:type,data:{labels:labels,datasets:sets},options:Object.assign({maintainAspectRatio:false,plugins:{legend:{display:sets.length>1||type==='doughnut',position:'bottom'}}},o||{})});}
+mk('g1','line',D.jours.labels,[{label:'Revenus',data:D.jours.revenus,borderColor:C[0],backgroundColor:'rgba(10,125,60,.15)',fill:true,tension:.3},{label:'Bénéfice',data:D.jours.benefices,borderColor:C[1],tension:.3}]);
+mk('g2','bar',D.quartiers.labels,[{label:'Courses',data:D.quartiers.v,backgroundColor:C[0],borderRadius:6}],{indexAxis:'y'});
+mk('g3','doughnut',D.paiements.labels,[{data:D.paiements.v,backgroundColor:C}]);
+mk('g4','bar',[...Array(24).keys()].map(h=>h+'h'),[{label:'Courses',data:D.heures,backgroundColor:C[2],borderRadius:4}]);
+mk('g5','bar',['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'],[{label:'Courses',data:D.semaine,backgroundColor:C[1],borderRadius:6}]);
+</script>
+""")
+
+PAGE_CLIENTS = BASE.replace("{% block corps %}{% endblock %}", """
+<style>
+.crm-head{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}.crm-head h1{margin:0;font-size:1.7rem;letter-spacing:-.03em}.crm-head p{margin:5px 0 0;color:var(--mut)}
+.crm-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:16px}.crm-stats .stat{min-width:0}.crm-stats .stat b{font-size:1.35rem}
+.crm-tabs{display:flex;gap:8px;overflow-x:auto;padding:2px 1px 12px;margin-bottom:3px}.crm-tab{flex:none;display:flex;align-items:center;gap:7px;padding:9px 12px;border:1px solid var(--bord);border-radius:12px;background:var(--card);color:var(--mut);text-decoration:none;font-weight:650;font-size:.84rem}.crm-tab:hover,.crm-tab.on{border-color:var(--vert2);background:var(--soft);color:var(--vert)}.crm-tab em{font-style:normal;font-size:.73rem;padding:2px 7px;border-radius:999px;background:var(--bg)}
+.crm-search{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;align-items:end;padding:13px 15px;margin-bottom:10px}.crm-search label{margin:0}.crm-meta{display:flex;justify-content:space-between;align-items:center;gap:10px;color:var(--mut);font-size:.84rem;padding:4px 2px 11px}.crm-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.crm-card{min-width:0;background:var(--card);border:1px solid var(--bord);border-radius:15px;padding:15px;box-shadow:var(--ombre)}.crm-card-top,.crm-card-bottom{display:flex;justify-content:space-between;align-items:flex-start;gap:9px;flex-wrap:wrap}.crm-name{min-width:0}.crm-name b{display:block;font-size:1.02rem;overflow-wrap:anywhere}.crm-name a{color:var(--txt);text-decoration:none}.crm-name a:hover{color:var(--vert)}.crm-name small{display:block;color:var(--mut);margin-top:2px}.crm-badges{display:flex;gap:5px;flex-wrap:wrap}.crm-badges .tag{white-space:nowrap}.crm-numbers{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:13px 0}.crm-number{min-width:0;padding:9px;border:1px solid var(--bord);border-radius:10px;background:var(--bg)}.crm-number small{display:block;color:var(--mut);font-size:.68rem;text-transform:uppercase;letter-spacing:.04em;font-weight:700}.crm-number b{display:block;margin-top:2px;font-size:.94rem;overflow-wrap:anywhere}.crm-number.debt b{color:var(--rouge)}.crm-card-bottom{align-items:center}.crm-actions{display:flex;gap:6px;flex-wrap:wrap}.crm-actions .btn{padding:7px 11px;font-size:.78rem}.crm-empty{text-align:center;padding:32px 14px}.crm-pages{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:14px 0 70px}
+@media(max-width:760px){.crm-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.crm-grid{grid-template-columns:1fr}}
+@media(max-width:520px){.crm-head h1{font-size:1.45rem}.crm-head>.btn{width:100%;justify-content:center}.crm-search{grid-template-columns:1fr 1fr}.crm-search label{grid-column:1/-1}.crm-search .btn,.crm-search button{justify-content:center}.crm-card{padding:12px}.crm-numbers{gap:5px}.crm-number{padding:8px 6px}.crm-number b{font-size:.84rem}.crm-actions{width:100%}.crm-actions .btn{flex:1;justify-content:center}}
+</style>
+<header class="crm-head"><div><h1>👥 Espace clients</h1><p>Ton mini-CRM : retrouve tes clients, suis leurs habitudes et transforme un ancien passage en nouvelle commande.</p></div><a class="btn" href="{{ url_for('nouvelle', retour='clients', segment=segment, q=q) }}">＋ Nouvelle livraison</a></header>
+<section class="crm-stats">
+ <div class="stat"><b>{{ resume.total }}</b><span>clients connus</span></div>
+ <div class="stat"><b>{{ resume.fideles }}</b><span>clients fidèles · 3+ courses</span></div>
+ <div class="stat ambre"><b>{{ resume.nouveaux }}</b><span>première commande · 30 j</span></div>
+ <div class="stat rouge"><b>{{ resume.impayes|fcfa }} F</b><span>créances clients</span></div>
+</section>
+<nav class="crm-tabs" aria-label="Segments de clients">
+ {% for s in segments %}<a class="crm-tab {{ 'on' if segment == s.id else '' }}" href="{{ url_for('clients', segment=s.id, q=q) }}">{{ s.icone }} {{ s.nom }} <em>{{ s.n }}</em></a>{% endfor %}
+</nav>
+<form class="card crm-search" method="get" action="{{ url_for('clients') }}">
+ <input type="hidden" name="segment" value="{{ segment }}">
+ <label>🔎 Rechercher un client<input type="search" name="q" value="{{ q }}" placeholder="Nom, téléphone, quartier ou type de client…"></label>
+ <button type="submit">Rechercher</button><a class="btn sec" href="{{ url_for('clients', segment=segment) }}">Effacer</a>
+</form>
+<div class="crm-meta"><span><b>{{ total }}</b> client{{ '' if total == 1 else 's' }}{% if q %} trouvé{{ '' if total == 1 else 's' }} pour « {{ q }} »{% endif %}</span><span>Page {{ page }} / {{ pages }}</span></div>
+<section class="crm-grid">
+{% for c in lignes %}<article class="crm-card">
+ <div class="crm-card-top"><div class="crm-name"><b><a href="{{ url_for('client', k=c.cle) }}">{{ c.nom or c.tel or 'Client sans nom' }}</a></b><small>{% if c.tel %}{{ c.tel }}{% else %}Téléphone non renseigné{% endif %}{% if c.quartier %} · {{ c.quartier }}{% endif %}</small></div>
+ <div class="crm-badges">{% if c.type %}<span class="tag">{{ c.type }}</span>{% endif %}{% if c.n >= 3 %}<span class="tag payé">Fidèle</span>{% elif c.jours is not none and c.jours > 30 %}<span class="tag injoignable">À réactiver</span>{% endif %}</div></div>
+ <div class="crm-numbers"><div class="crm-number"><small>Courses</small><b>{{ c.n }}</b></div><div class="crm-number"><small>Total courses</small><b>{{ c.total|fcfa }} F</b></div><div class="crm-number {{ 'debt' if c.impaye else '' }}"><small>À encaisser</small><b>{{ c.impaye|fcfa }} F</b></div></div>
+ <div class="crm-card-bottom"><span class="mut">Dernière commande : {% if c.derniere %}{% if c.jours == 0 %}aujourd’hui{% elif c.jours == 1 %}hier{% else %}{{ c.derniere }}{% endif %}{% else %}—{% endif %}</span>
+ <div class="crm-actions"><a class="btn sec" href="{{ url_for('client', k=c.cle) }}">Ouvrir la fiche</a>{% if c.wa %}<a class="btn sec" href="https://wa.me/{{ c.wa }}" target="_blank" rel="noopener">WhatsApp</a>{% endif %}<a class="btn" href="{{ url_for('nouvelle', client=c.cle, retour='client', k=c.cle) }}">＋ Commander</a></div></div>
+</article>{% else %}<div class="card crm-empty"><h2>Aucun client dans cette rubrique</h2><p class="mut">Essaie une autre recherche ou change de segment.</p><a class="btn sec" href="{{ url_for('clients') }}">Voir tous les clients</a></div>{% endfor %}
+</section>
+{% if pages > 1 %}<nav class="crm-pages">{% if page > 1 %}<a class="btn sec" href="{{ url_for('clients', segment=segment, q=q, page=page-1) }}">← Précédent</a>{% else %}<span></span>{% endif %}<span class="mut">Page {{ page }} sur {{ pages }}</span>{% if page < pages %}<a class="btn sec" href="{{ url_for('clients', segment=segment, q=q, page=page+1) }}">Suivant →</a>{% endif %}</nav>{% endif %}
+""")
+
+PAGE_CLIENT = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="card"><p><a class="btn sec" href="{{ url_for('clients') }}">← Tous les clients</a> <a class="btn" href="{{ url_for('nouvelle', client=cle, retour='client', k=cle) }}">＋ Nouvelle livraison pour ce client</a></p>
+{% if msg %}<p><span class="pastille {{ 'rouge' if erreur else '' }}">{{ msg }}</span></p>{% endif %}
+<h2>{{ nom }} {% if n >= 3 %}<span class="tag payé">client fidèle</span>{% endif %}</h2>
+<p class="mut">{{ tel }}{% if tel %} · <a href="https://wa.me/{{ wa }}" target="_blank">Ouvrir WhatsApp</a>{% endif %}</p>
+<div class="stats"><div class="stat"><b>{{ n }}</b><span>courses</span></div>
+<div class="stat"><b>{{ total|fcfa }} F</b><span>total dépensé</span></div>
+<div class="stat"><b>{{ panier|fcfa }} F</b><span>panier moyen</span></div>
+<div class="stat"><b>{{ impaye|fcfa }} F</b><span>à encaisser</span></div></div>
+{% if impaye and relance %}<p><a class="btn" target="_blank" href="{{ relance }}">Relancer sur WhatsApp</a></p>{% endif %}</div>
+<div class="card"><h2>Profil et habitudes</h2><div class="stats">
+<div class="stat"><b>{{ profil.type or '-' }}</b><span>Type de client</span></div>
+<div class="stat"><b>{{ profil.source or '-' }}</b><span>Comment il nous a connus</span></div>
+<div class="stat"><b>{{ profil.quartier or '-' }}</b><span>Quartier</span></div>
+<div class="stat"><b>{{ profil.freq or '-' }}</b><span>Délai moyen entre commandes</span></div>
+<div class="stat"><b>{{ profil.premiere or '-' }}</b><span>Première commande</span></div>
+<div class="stat"><b>{{ profil.derniere or '-' }}</b><span>Dernière commande</span></div></div>
+<div class="grille" style="margin-top:14px">
+<div><h2>Produits commandés</h2>{% for p, k in profil.produits %}<div class="ligne"><span>{{ p }}</span><span class="tag">{{ k }}x</span></div>{% else %}<p class="mut">Pas encore renseigné</p>{% endfor %}</div>
+<div><h2>Boutiques / fournisseurs</h2>{% for p, k in profil.boutiques %}<div class="ligne"><span>{{ p }}</span><span class="tag">{{ k }}x</span></div>{% else %}<p class="mut">Pas encore renseigné</p>{% endfor %}</div>
+<div><h2>Quartiers livrés</h2>{% for p, k in profil.quartiers %}<div class="ligne"><span>{{ p }}</span><span class="tag">{{ k }}x</span></div>{% else %}<p class="mut">Pas encore renseigné</p>{% endfor %}</div>
+</div></div>
+<form method="post" class="card"><h2>Notes sur ce client</h2><input type="hidden" name="k" value="{{ cle }}">
+<textarea name="note" rows="3" placeholder="Ex : préfère être livré après 18h, paie par Orange Money…">{{ note }}</textarea>
+<p><button>Enregistrer la note</button></p></form>
+<div class="card"><h2>Historique</h2>""" + LIGNES + "</div>")
+
+PAGE_FACTURE = """<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Facture {{ l.numero }}</title>
+<style>body{font-family:system-ui,Arial,sans-serif;max-width:720px;margin:24px auto;padding:0 16px;color:#111}
+h1{margin:0;color:#0a7d3c}.top{display:flex;justify-content:space-between;border-bottom:3px solid #0a7d3c;padding-bottom:12px}
+table{width:100%;border-collapse:collapse;margin:20px 0}td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left}
+.tot{font-size:1.3rem;text-align:right}.stamp{display:inline-block;border:3px solid;padding:4px 14px;border-radius:8px;font-weight:700;transform:rotate(-6deg);margin-left:12px}
+.ok{color:#0a7d3c}.no{color:#c0392b}button{background:#0a7d3c;color:#fff;border:0;padding:10px 16px;border-radius:8px;font-size:1rem;cursor:pointer}
+@media print{.noprint{display:none}}</style></head><body>
+<p class="noprint"><button onclick="window.print()">Imprimer / enregistrer en PDF</button> <a href="{{ url_for('toutes') }}">Retour</a></p>
+<div class="top"><div><h1>FACTURE</h1><b>{{ l.numero|replace('LIV','FAC') }}</b><br>Date : {{ (l.cree_le or '')[:10] }}</div>
+<div style="text-align:right"><b>{{ e.nom }}</b><br>{{ e.responsable }}<br>{{ e.tel }}<br>{{ e.ville }}</div></div>
+<p><b>Client :</b> {{ l.client_nom }} {{ l.client_tel }}</p>
+<table><tr><th>Description</th><th style="text-align:right">Montant</th></tr>
+<tr><td>Course de livraison<br><small>{{ l.collecte_lieu or l.collecte_quartier }} → {{ l.livraison_adresse or l.livraison_quartier }}</small></td><td style="text-align:right">{{ l.prix_course|fcfa }} F</td></tr>
+{% if l.valeur_produit %}<tr><td>Produit avancé : {{ l.colis }}</td><td style="text-align:right">{{ l.valeur_produit|fcfa }} F</td></tr>{% endif %}</table>
+<p class="tot"><b>Total : {{ total|fcfa }} FCFA</b></p>
+<p>Mode de paiement : {{ l.mode_paiement }}{% if l.statut_paiement == 'payé' %}<span class="stamp ok">PAYÉ</span>{% else %}<span class="stamp no">À PAYER</span>{% endif %}</p>
+<p><small>Merci de votre confiance.</small></p></body></html>"""
+
+
+@app.route("/stats")
+def stats():
+    with db() as con:
+        k = con.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(prix_course),0) rev, COALESCE(SUM(frais),0) fr, "
+            "COALESCE(AVG(prix_course),0) panier, COALESCE(SUM(distance_km),0) km "
+            "FROM livraisons WHERE statut!='annulé'").fetchone()
+        tot = con.execute("SELECT COUNT(*) FROM livraisons").fetchone()[0]
+        perdu = con.execute("SELECT COUNT(*) FROM livraisons WHERE statut IN ('annulé','injoignable')").fetchone()[0]
+        duree = con.execute(
+            "SELECT AVG((julianday(heure_livraison)-julianday(heure_collecte))*1440) FROM livraisons "
+            "WHERE heure_collecte IS NOT NULL AND heure_livraison IS NOT NULL").fetchone()[0]
+        quartiers = con.execute(
+            "SELECT livraison_quartier l, COUNT(*) n FROM livraisons WHERE livraison_quartier!='' "
+            "AND statut!='annulé' GROUP BY l ORDER BY n DESC LIMIT 8").fetchall()
+        paiements = con.execute(
+            "SELECT mode_paiement l, COUNT(*) n FROM livraisons WHERE mode_paiement!='' "
+            "AND statut!='annulé' GROUP BY l").fetchall()
+        heures = {r["h"]: r["n"] for r in con.execute(
+            "SELECT strftime('%H', cree_le) h, COUNT(*) n FROM livraisons WHERE statut!='annulé' GROUP BY h")}
+        semaine = {r["d"]: r["n"] for r in con.execute(
+            "SELECT strftime('%w', cree_le) d, COUNT(*) n FROM livraisons WHERE statut!='annulé' GROUP BY d")}
+    net = k["rev"] - k["fr"]
+    kpi = {
+        "panier": k["panier"], "net": net, "par_course": net / k["n"] if k["n"] else 0,
+        "duree": f"{duree:.0f} min" if duree else "-",
+        "annul": round(100 * perdu / tot) if tot else 0, "km": round(k["km"]),
+    }
+    data = {
+        "jours": serie_jours(30),
+        "quartiers": {"labels": [r["l"] for r in quartiers], "v": [r["n"] for r in quartiers]},
+        "paiements": {"labels": [r["l"] for r in paiements], "v": [r["n"] for r in paiements]},
+        "heures": [heures.get(f"{i:02d}", 0) for i in range(24)],
+        "semaine": [semaine.get(str(i), 0) for i in (1, 2, 3, 4, 5, 6, 0)],
+    }
+    return render_template_string(PAGE_STATS, k=kpi, data=data)
+
+
+@app.route("/clients")
+def clients():
+    q = request.args.get("q", "").strip()
+    segment = request.args.get("segment", "tous")
+    if segment not in {"tous", "nouveaux", "fideles", "inactifs", "creances"}:
+        segment = "tous"
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    taille_page = 20
+    with db() as con:
+        lignes = [dict(r) for r in con.execute(
+            f"SELECT {CLE} cle, MAX(NULLIF(client_nom,'')) nom, MAX(NULLIF(client_tel,'')) tel, COUNT(*) n, "
+            "COALESCE(SUM(prix_course),0) total, MAX(date(cree_le)) derniere, MIN(date(cree_le)) premiere, "
+            "COALESCE(SUM(CASE WHEN statut='livré' AND statut_paiement!='payé' THEN prix_course ELSE 0 END),0) impaye, "
+            "MAX(NULLIF(client_quartier,'')) quartier, MAX(NULLIF(type_client,'')) type "
+            f"FROM livraisons WHERE statut!='annulé' GROUP BY {CLE} ORDER BY derniere DESC, total DESC").fetchall()]
+
+    aujourd_hui = datetime.now().date()
+
+    def age(date_texte):
+        if not date_texte:
+            return None
+        try:
+            return (aujourd_hui - datetime.strptime(str(date_texte)[:10], "%Y-%m-%d").date()).days
+        except ValueError:
+            return None
+
+    for c in lignes:
+        c["jours"] = age(c["derniere"])
+        c["age_premiere"] = age(c["premiere"])
+        c["wa"] = tel_wa(c["tel"])
+
+    resume = {
+        "total": len(lignes),
+        "fideles": sum(c["n"] >= 3 for c in lignes),
+        "nouveaux": sum(c["age_premiere"] is not None and c["age_premiere"] <= 30 for c in lignes),
+        "inactifs": sum(c["jours"] is not None and c["jours"] > 30 for c in lignes),
+        "creances": sum(bool(c["impaye"]) for c in lignes),
+        "impayes": sum(c["impaye"] for c in lignes),
+    }
+    segments = [
+        {"id": "tous", "nom": "Tous", "icone": "👥", "n": resume["total"]},
+        {"id": "nouveaux", "nom": "Nouveaux · 30 j", "icone": "✨", "n": resume["nouveaux"]},
+        {"id": "fideles", "nom": "Fidèles", "icone": "⭐", "n": resume["fideles"]},
+        {"id": "inactifs", "nom": "À réactiver", "icone": "🔔", "n": resume["inactifs"]},
+        {"id": "creances", "nom": "Créances", "icone": "💸", "n": resume["creances"]},
+    ]
+    filtres = {
+        "nouveaux": lambda c: c["age_premiere"] is not None and c["age_premiere"] <= 30,
+        "fideles": lambda c: c["n"] >= 3,
+        "inactifs": lambda c: c["jours"] is not None and c["jours"] > 30,
+        "creances": lambda c: bool(c["impaye"]),
+    }
+    lignes = [c for c in lignes if segment == "tous" or filtres[segment](c)]
+    if q:
+        needle = q.lower()
+        qd = chiffres(q)
+        lignes = [c for c in lignes if needle in (c["nom"] or "").lower()
+                  or (qd and qd in chiffres(c["tel"]))
+                  or needle in (c["quartier"] or "").lower() or needle in (c["type"] or "").lower()]
+    if segment == "fideles":
+        lignes.sort(key=lambda c: (-c["n"], -c["total"]))
+    elif segment == "creances":
+        lignes.sort(key=lambda c: (-c["impaye"], -(c["jours"] or 0)))
+    elif segment == "inactifs":
+        lignes.sort(key=lambda c: (-(c["jours"] or 0), -c["total"]))
+    else:
+        lignes.sort(key=lambda c: c["derniere"] or "", reverse=True)
+    total = len(lignes)
+    pages = max(1, (total + taille_page - 1) // taille_page)
+    page = min(page, pages)
+    debut = (page - 1) * taille_page
+    return render_template_string(PAGE_CLIENTS, lignes=lignes[debut:debut + taille_page], q=q,
+                                  segment=segment, segments=segments, resume=resume,
+                                  total=total, page=page, pages=pages)
+
+
+@app.route("/client", methods=["GET", "POST"])
+def client():
+    cle = request.values.get("k", "")
+    with db() as con:
+        if request.method == "POST":
+            con.execute("INSERT INTO notes_clients(cle,note) VALUES(?,?) "
+                        "ON CONFLICT(cle) DO UPDATE SET note=excluded.note", (cle, request.form.get("note", "")))
+        lignes = con.execute(f"SELECT * FROM livraisons WHERE {CLE}=? ORDER BY id DESC", (cle,)).fetchall()
+        note = con.execute("SELECT note FROM notes_clients WHERE cle=?", (cle,)).fetchone()
+    if not lignes:
+        return redirect(url_for("clients"))
+    ok = [l for l in lignes if l["statut"] != "annulé"]
+    total = sum(l["prix_course"] or 0 for l in ok)
+    dus = [l for l in lignes if l["statut"] == "livré" and l["statut_paiement"] != "payé"]
+    nom = next((l["client_nom"] for l in lignes if l["client_nom"]), "") or "Client"
+    tel = next((l["client_tel"] for l in lignes if l["client_tel"]), "")
+    return render_template_string(
+        PAGE_CLIENT, lignes=lignes, cle=cle, nom=nom, tel=tel, wa=tel_wa(tel), n=len(ok), total=total,
+        panier=total / len(ok) if ok else 0, impaye=sum(l["prix_course"] or 0 for l in dus),
+        relance=lien_relance(dus[0]) if dus else "", note=note["note"] if note else "",
+        profil=profil_client(lignes), msg=request.args.get("msg", "")[:200],
+        erreur=request.args.get("erreur", "") == "1")
+
+
+@app.route("/facture/<int:id>")
+def facture(id):
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+    if not l:
+        return redirect(url_for("toutes"))
+    total = (l["prix_course"] or 0) + (l["valeur_produit"] or 0)
+    return render_template_string(PAGE_FACTURE, l=l, e=entreprise_infos(), total=total)
+
+
+# ===================== V3 : recherche globale, produits, marché =====================
+def chiffres(t):
+    n = "".join(ch for ch in (t or "") if ch.isdigit())
+    return n[3:] if n.startswith("226") and len(n) > 8 else n
+
+
+def migrer(con):
+    """Ajoute les nouvelles colonnes à une ancienne base sans perdre les données."""
+    existantes = {r[1] for r in con.execute("PRAGMA table_info(livraisons)")}
+    for cle, _, _, _ in CHAMPS:
+        if cle not in existantes:
+            con.execute(f"ALTER TABLE livraisons ADD COLUMN {cle} {'REAL' if cle in NOMBRES else 'TEXT'}")
+    for r in con.execute("SELECT id, client_tel, destinataire_tel FROM livraisons").fetchall():
+        a, b = chiffres(r[1]), chiffres(r[2])
+        if (a, b) != ((r[1] or ""), (r[2] or "")):
+            con.execute("UPDATE livraisons SET client_tel=?, destinataire_tel=? WHERE id=?", (a, b, r[0]))
+
+
+def lien_reprise(c):
+    n = tel_wa(c["tel"])
+    if not n:
+        return ""
+    txt = (f"Bonjour {c['nom'] or ''}, ça fait un moment ! LIR reste disponible pour toutes vos "
+           "livraisons rapides. N'hésitez pas à nous écrire 🏍️")
+    return f"https://wa.me/{n}?text={quote(txt)}"
+
+
+app.jinja_env.globals["lien_reprise"] = lien_reprise
+
+
+def profil_client(lignes):
+    ok = [l for l in lignes if l["statut"] != "annulé"]
+
+    def top(cle):
+        c = {}
+        for l in ok:
+            v = (l[cle] or "").strip()
+            if v:
+                c[v] = c.get(v, 0) + 1
+        return sorted(c.items(), key=lambda x: -x[1])[:5]
+
+    def dernier(cle):
+        return next((l[cle] for l in lignes if l[cle]), "")
+
+    dates = sorted((l["cree_le"] or "")[:10] for l in ok if l["cree_le"])
+    freq = ""
+    if len(dates) > 1:
+        d0, d1 = (datetime.strptime(d, "%Y-%m-%d") for d in (dates[0], dates[-1]))
+        freq = f"{(d1 - d0).days / (len(dates) - 1):.0f} jours"
+    return {"type": dernier("type_client"), "source": dernier("source_client"),
+            "quartier": dernier("client_quartier") or dernier("livraison_quartier"),
+            "premiere": dates[0] if dates else "", "derniere": dates[-1] if dates else "", "freq": freq,
+            "produits": top("produit"), "boutiques": top("collecte_lieu"), "quartiers": top("livraison_quartier")}
+
+
+PAGE_RECHERCHE = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="card"><h2>Clients trouvés pour « {{ q }} » ({{ cl|length }})</h2>
+<div class="scroll"><table><tr><th>Client</th><th>Courses</th><th>Total</th><th>À encaisser</th></tr>
+{% for c in cl %}<tr><td><a href="{{ url_for('client', k=c.cle) }}">{{ c.nom or c.tel or 'Inconnu' }}</a><br><span class="mut">{{ c.tel }}</span></td>
+<td>{{ c.n }}</td><td>{{ c.total|fcfa }} F</td><td>{{ c.impaye|fcfa }} F</td></tr>
+{% else %}<tr><td class="mut">Aucun client trouvé</td></tr>{% endfor %}</table></div></div>
+<div class="card"><h2>Livraisons trouvées ({{ lignes|length }})</h2>""" + LIGNES + "</div>")
+
+PAGE_MARCHE = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="card"><h2>Clients</h2><div class="stats">
+ <div class="stat"><b>{{ kc.total }}</b><span>clients</span></div>
+ <div class="stat"><b>{{ kc.nouveaux }}</b><span>nouveaux (30 jours)</span></div>
+ <div class="stat"><b>{{ kc.fideles }}</b><span>reviennent (2 courses ou +)</span></div>
+ <div class="stat"><b>{{ kc.reguliers }}</b><span>réguliers (5 ou +)</span></div>
+ <div class="stat"><b>{{ kc.taux }} %</b><span>taux de fidélité</span></div>
+ <div class="stat"><b>{{ kc.inactifs }}</b><span>inactifs (+30 jours)</span></div></div></div>
+{% if not produits %}<div class="card"><p class="mut">Renseigne la catégorie et le produit à chaque livraison : cette page se remplit au fur et à mesure.</p></div>{% endif %}
+<div class="grille">
+<div class="card"><h2>Produits les plus demandés</h2><div class="chart"><canvas id="m1"></canvas></div></div>
+<div class="card"><h2>Catégories de produits</h2><div class="chart"><canvas id="m2"></canvas></div></div>
+<div class="card"><h2>Types de clients</h2><div class="chart"><canvas id="m3"></canvas></div></div>
+<div class="card"><h2>Boutiques / fournisseurs sollicités</h2><div class="chart"><canvas id="m4"></canvas></div></div>
+</div>
+<div class="card"><h2>Détail par produit</h2><div class="scroll"><table>
+<tr><th>Produit</th><th>Catégorie</th><th>Commandes</th><th>Quantité</th><th>Clients</th><th>Valeur moy.</th></tr>
+{% for p in produits %}<tr><td>{{ p.produit }}</td><td>{{ p.categorie or '-' }}</td><td>{{ p.n }}</td><td>{{ p.qte|round|int }}</td><td>{{ p.clients }}</td><td>{{ p.valeur|fcfa }} F</td></tr>
+{% else %}<tr><td class="mut">Pas encore de données</td></tr>{% endfor %}</table></div></div>
+<div class="card"><h2>Quartiers : où est la demande ?</h2><div class="scroll"><table>
+<tr><th>Quartier</th><th>Courses</th><th>Clients</th><th>Revenu</th><th>Panier moyen</th></tr>
+{% for q in quartiers %}<tr><td>{{ q.l }}</td><td>{{ q.n }}</td><td>{{ q.clients }}</td><td>{{ q.r|fcfa }} F</td><td>{{ q.p|fcfa }} F</td></tr>
+{% else %}<tr><td class="mut">Pas encore de données</td></tr>{% endfor %}</table></div></div>
+<div class="card"><h2>Clients à réactiver ({{ kc.inactifs }})</h2>
+{% for c in inactifs %}<div class="ligne"><div><b>{{ c.nom or c.tel }}</b><br><span class="mut">{{ c.n }} courses · {{ c.total|fcfa }} F · dernière il y a {{ c.jours }} j</span></div>
+{% if lien_reprise(c) %}<a class="btn" target="_blank" href="{{ lien_reprise(c) }}">Reprendre contact</a>{% endif %}</div>
+{% else %}<p class="mut">Aucun client inactif pour le moment.</p>{% endfor %}</div>
+<script>
+const D={{ data|tojson }};const C=['#0a7d3c','#f2a900','#2d7ff9','#d64545','#8e5bd9','#16b3a5','#e86fa4','#7a8b83'];
+function mk(id,type,d,o){if(!window.Chart||!d.l.length)return;new Chart(document.getElementById(id),{type:type,data:{labels:d.l,datasets:[{data:d.v,backgroundColor:type==='doughnut'?C:C[0],borderRadius:6}]},options:Object.assign({maintainAspectRatio:false,plugins:{legend:{display:type==='doughnut',position:'bottom'}}},o||{})});}
+mk('m1','bar',D.produits,{indexAxis:'y'});mk('m2','doughnut',D.categories);mk('m3','doughnut',D.types);mk('m4','bar',D.boutiques,{indexAxis:'y'});
+</script>
+""")
+
+
+@app.route("/recherche")
+def recherche():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return redirect(url_for("clients"))
+    qd, like = chiffres(q), f"%{q.lower()}%"
+    propre = lambda col: f"REPLACE(REPLACE({col},' ',''),'-','')"
+    cond_c, par_c = ["LOWER(COALESCE(client_nom,'')) LIKE ?"], [like]
+    champs = ["client_nom", "colis", "produit", "categorie", "collecte_lieu", "livraison_quartier",
+              "livraison_adresse", "destinataire_nom", "numero", "remarques"]
+    cond_l, par_l = [f"LOWER(COALESCE({c},'')) LIKE ?" for c in champs], [like] * len(champs)
+    if len(qd) >= 3:
+        cond_c.append(f"{propre('client_tel')} LIKE ?")
+        par_c.append(f"%{qd}%")
+        cond_l += [f"{propre('client_tel')} LIKE ?", f"{propre('destinataire_tel')} LIKE ?"]
+        par_l += [f"%{qd}%"] * 2
+    with db() as con:
+        cl = con.execute(
+            f"SELECT {CLE} cle, MAX(client_nom) nom, MAX(client_tel) tel, COUNT(*) n, "
+            "COALESCE(SUM(CASE WHEN statut!='annulé' THEN prix_course END),0) total, "
+            "COALESCE(SUM(CASE WHEN statut='livré' AND statut_paiement!='payé' THEN prix_course END),0) impaye "
+            f"FROM livraisons WHERE {CLE} IN (SELECT {CLE} FROM livraisons WHERE {' OR '.join(cond_c)}) "
+            "GROUP BY cle ORDER BY total DESC", par_c).fetchall()
+        lignes = con.execute(f"SELECT * FROM livraisons WHERE {' OR '.join(cond_l)} ORDER BY id DESC LIMIT 100",
+                             par_l).fetchall()
+    return render_template_string(PAGE_RECHERCHE, q=q, cl=cl, lignes=lignes)
+
+
+@app.route("/marche")
+def marche():
+    ok = "statut!='annulé'"
+    with db() as con:
+        rows = lambda sql: con.execute(sql).fetchall()
+        cl = rows(f"SELECT {CLE} cle, MAX(client_nom) nom, MAX(client_tel) tel, COUNT(*) n, MIN(date(cree_le)) premiere, "
+                  f"MAX(date(cree_le)) derniere, COALESCE(SUM(prix_course),0) total FROM livraisons WHERE {ok} GROUP BY cle")
+        produits = rows(
+            "SELECT MIN(produit) produit, MAX(categorie) categorie, COUNT(*) n, "
+            f"SUM(CASE WHEN quantite>0 THEN quantite ELSE 1 END) qte, COUNT(DISTINCT {CLE}) clients, "
+            f"COALESCE(AVG(NULLIF(valeur_produit,0)),0) valeur FROM livraisons WHERE {ok} AND produit!='' "
+            "GROUP BY LOWER(produit) ORDER BY n DESC LIMIT 15")
+        categories = rows(f"SELECT categorie l, COUNT(*) n FROM livraisons WHERE {ok} AND categorie!='' GROUP BY l ORDER BY n DESC")
+        types = rows(f"SELECT type_client l, COUNT(*) n FROM livraisons WHERE {ok} AND type_client!='' GROUP BY l ORDER BY n DESC")
+        boutiques = rows(f"SELECT MIN(collecte_lieu) l, COUNT(*) n FROM livraisons WHERE {ok} AND collecte_lieu!='' "
+                         "GROUP BY LOWER(collecte_lieu) ORDER BY n DESC LIMIT 8")
+        quartiers = rows(
+            f"SELECT MIN(livraison_quartier) l, COUNT(*) n, COUNT(DISTINCT {CLE}) clients, COALESCE(SUM(prix_course),0) r, "
+            f"COALESCE(AVG(prix_course),0) p FROM livraisons WHERE {ok} AND livraison_quartier!='' "
+            "GROUP BY LOWER(livraison_quartier) ORDER BY n DESC LIMIT 10")
+    auj = datetime.now().date()
+    jours = lambda d: (auj - datetime.strptime(d, "%Y-%m-%d").date()).days
+    cl = [c for c in cl if c["derniere"]]
+    kc = {"total": len(cl), "nouveaux": sum(1 for c in cl if jours(c["premiere"]) <= 30),
+          "fideles": sum(1 for c in cl if c["n"] >= 2), "reguliers": sum(1 for c in cl if c["n"] >= 5)}
+    kc["taux"] = round(100 * kc["fideles"] / kc["total"]) if kc["total"] else 0
+    inactifs = sorted((dict(c, jours=jours(c["derniere"])) for c in cl if jours(c["derniere"]) > 30),
+                      key=lambda c: -c["total"])
+    kc["inactifs"] = len(inactifs)
+    paire = lambda r: {"l": [x["l"] for x in r], "v": [x["n"] for x in r]}
+    data = {"produits": {"l": [p["produit"] for p in produits[:8]], "v": [p["n"] for p in produits[:8]]},
+            "categories": paire(categories), "types": paire(types), "boutiques": paire(boutiques)}
+    return render_template_string(PAGE_MARCHE, kc=kc, produits=produits, quartiers=quartiers,
+                                  inactifs=inactifs[:10], data=data)
+
+
+# ===================== V4 : IA gratuite (Gemini) + distance automatique =====================
+import time
+import urllib.parse
+import urllib.request
+from math import asin, cos, radians, sin, sqrt
+
+UA = "LIR-Livraisons/1.0 (contact: " + os.environ.get("OSM_CONTACT", "usage-personnel") + ")"
+VIEWBOX = "-1.75,12.52,-1.30,12.22"  # zone de Ouagadougou
+_dernier_geocodage = [0.0]
+
+
+def _http_json(url, corps=None, entetes=None, delai=20):
+    req = urllib.request.Request(
+        url, data=json.dumps(corps).encode("utf-8") if corps is not None else None,
+        headers={"User-Agent": UA, "Content-Type": "application/json", **(entetes or {})})
+    with urllib.request.urlopen(req, timeout=delai) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _lire_json(texte):
+    debut, fin = texte.find("{"), texte.rfind("}")
+    if debut == -1 or fin == -1:
+        raise ValueError("Réponse de l'IA illisible")
+    brut = json.loads(texte[debut:fin + 1])
+    return {k: ("" if brut.get(k) is None else brut.get(k)) for k in CLES}
+
+
+MODELES_GEMINI = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-3.8-flash",
+                  "gemini-2.5-flash-lite", "gemini-2.5-flash"]  # les modèles « lite » d'abord : plus rapides, moins sollicités
+_modele_gemini_ok = []
+
+
+def appel_gemini(corps, delai=45):
+    """Appelle Gemini. Si un modèle n'existe plus (404), est surchargé (503), saturé (429) ou trop lent, essaie le suivant.
+    GEMINI_MODEL, s'il est défini, passe en premier. Retourne (réponse, modèle utilisé)."""
+    choix = os.environ.get("GEMINI_MODEL", "").strip()
+    candidats = list(dict.fromkeys(([choix] if choix else _modele_gemini_ok) + MODELES_GEMINI))
+    derniere, pannes_reseau = None, 0
+    for modele in candidats:
+        for tentative in (0, 1):
+            try:
+                rep = _http_json(f"https://generativelanguage.googleapis.com/v1beta/models/{modele}:generateContent", corps,
+                                 {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}, delai)
+                _modele_gemini_ok[:] = [modele]
+                return rep, modele
+            except urllib.error.HTTPError as e:
+                if e.code not in (404, 429, 500, 502, 503, 504):  # autres erreurs (clé refusée...) : inutile de réessayer
+                    raise
+                derniere = e
+                if e.code >= 500 and tentative == 0:  # surcharge passagère de Google : 2e essai après une courte pause
+                    time.sleep(2)
+                    continue
+                break  # modèle disparu (404), quota atteint (429) ou surcharge persistante : modèle suivant
+            except (TimeoutError, OSError) as e:  # pas de réponse à temps : connexion lente ou modèle lent
+                derniere = e
+                pannes_reseau += 1
+                if pannes_reseau >= 2:  # inutile d'insister si la connexion est coupée
+                    raise
+                break
+    raise derniere
+
+
+def extraire_avec_gemini(message):
+    rep, _ = appel_gemini(
+        {"systemInstruction": {"parts": [{"text": PROMPT_SYSTEME}]},
+         "contents": [{"role": "user", "parts": [{"text": message}]}],
+         "generationConfig": {"responseMimeType": "application/json", "temperature": 0}})
+    return _lire_json(rep["candidates"][0]["content"]["parts"][0]["text"])
+
+
+def extraire_avec_ia(message):
+    """Essaie Gemini (gratuit) puis Claude, ou l'inverse si IA_FOURNISSEUR=claude."""
+    moteurs = []
+    if os.environ.get("GEMINI_API_KEY"):
+        moteurs.append(extraire_avec_gemini)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        moteurs.append(extraire_avec_claude)
+    if os.environ.get("IA_FOURNISSEUR", "").lower() == "claude":
+        moteurs.reverse()
+    erreurs = []
+    for moteur in moteurs:
+        try:
+            return moteur(message)
+        except Exception as e:  # on essaie le moteur suivant
+            code = getattr(e, "code", None) or getattr(e, "status_code", "")
+            detail = ""
+            if isinstance(e, urllib.error.HTTPError):  # raison exacte donnée par le service (clé refusée, modèle inconnu...)
+                try:
+                    err = json.loads(e.read().decode("utf-8")).get("error", {})
+                    detail = f"({err.get('status', '')} {err.get('message', '')})"[:220]
+                except Exception:
+                    pass
+            erreurs.append(f"{'Gemini' if 'gemini' in moteur.__name__ else 'Claude'} : {type(e).__name__} {code} {detail}".strip())
+    raise RuntimeError(" ; ".join(erreurs) or "Aucune clé IA configurée")
+
+
+def geocoder(texte):
+    texte = " ".join((texte or "").split())
+    if not texte:
+        return None
+    with db() as con:
+        r = con.execute("SELECT lat, lon FROM geocache WHERE cle=?", (texte.lower(),)).fetchone()
+    if r:
+        return (r["lat"], r["lon"]) if r["lat"] is not None else None
+    attente = 1.1 - (time.time() - _dernier_geocodage[0])  # Nominatim : 1 requête/seconde maximum
+    if attente > 0:
+        time.sleep(attente)
+    res = _http_json("https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+        {"q": texte + ", Ouagadougou", "format": "json", "limit": 1, "countrycodes": "bf",
+         "viewbox": VIEWBOX, "bounded": 1}))
+    _dernier_geocodage[0] = time.time()
+    pos = (float(res[0]["lat"]), float(res[0]["lon"])) if res else None
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO geocache VALUES (?,?,?)",
+                    (texte.lower(), pos[0] if pos else None, pos[1] if pos else None))
+    return pos
+
+
+def vol_oiseau_km(p, q):
+    la1, lo1, la2, lo2 = map(radians, (p[0], p[1], q[0], q[1]))
+    h = sin((la2 - la1) / 2) ** 2 + cos(la1) * cos(la2) * sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371 * asin(sqrt(h))
+
+
+@app.route("/distance", methods=["POST"])
+def route_distance():
+    d = request.get_json(silent=True) or {}
+    try:
+        approx, pts = False, []
+        for plein, quartier in ((d.get("a", ""), d.get("qa", "")), (d.get("b", ""), d.get("qb", ""))):
+            p = geocoder(plein)
+            if not p and quartier and quartier != plein:
+                p, approx = geocoder(quartier), True
+            if not p:
+                return jsonify(erreur=f"Lieu introuvable : {plein}"), 404
+            pts.append(p)
+        if os.environ.get("ROUTAGE", "").lower() == "osrm":  # trajet routier réel (serveur OSRM)
+            base = os.environ.get("OSRM_URL", "https://router.project-osrm.org")
+            r = _http_json(f"{base}/route/v1/driving/{pts[0][1]},{pts[0][0]};{pts[1][1]},{pts[1][0]}?overview=false")
+            km, minutes = r["routes"][0]["distance"] / 1000, r["routes"][0]["duration"] / 60
+        else:  # estimation : distance à vol d'oiseau x 1,3, vitesse moyenne 25 km/h en ville
+            km = vol_oiseau_km(*pts) * 1.3
+            minutes = km / 25 * 60
+        return jsonify(km=round(km, 1), minutes=round(minutes), approx=approx)
+    except Exception as e:
+        return jsonify(erreur=f"Calcul impossible ({type(e).__name__})"), 500
+
+
+# ===================== V5 : préremplissage des informations client =====================
+@app.route("/api/clients")
+def api_clients():
+    q = request.args.get("q", "").strip()
+    if len(q) < 2:
+        return jsonify([])
+    qd = chiffres(q)
+    cond, par = ["LOWER(COALESCE(client_nom,'')) LIKE ?"], [f"%{q.lower()}%"]
+    if len(qd) >= 3:
+        cond.append("REPLACE(REPLACE(client_tel,' ',''),'-','') LIKE ?")
+        par.append(f"%{qd}%")
+    sortie = []
+    with db() as con:
+        cles = [r[0] for r in con.execute(
+            f"SELECT {CLE} c, MAX(id) m FROM livraisons WHERE {' OR '.join(cond)} GROUP BY c ORDER BY m DESC LIMIT 6", par)]
+        for cle in cles:
+            lignes = con.execute(f"SELECT * FROM livraisons WHERE {CLE}=? ORDER BY id DESC", (cle,)).fetchall()
+            dernier = lambda k: next((l[k] for l in lignes if l[k]), "")
+            sortie.append({
+                "nom": dernier("client_nom"), "tel": dernier("client_tel"),
+                "type_client": dernier("type_client"), "client_quartier": dernier("client_quartier"),
+                "source_client": dernier("source_client"), "mode_paiement": dernier("mode_paiement"),
+                "livraison_quartier": dernier("livraison_quartier"), "n": len(lignes),
+                "impaye": int(sum(l["prix_course"] or 0 for l in lignes
+                                  if l["statut"] == "livré" and l["statut_paiement"] != "payé"))})
+    return jsonify(sortie)
+
+
+# ===================== V6 : messages WhatsApp prêts en un clic =====================
+# Modifie librement les textes ci-dessous. Variables : {salut} {colis} {numero} {prix} {entreprise}
+# "cible" : à qui envoyer ("client" ou "destinataire" s'il a un numéro, sinon le client)
+MESSAGES = [
+    ("collecte", "📦 Colis collecté", "client",
+     "{salut}, j'ai bien récupéré votre colis ({colis}). Je pars vous le livrer ! - {entreprise}"),
+    ("route", "🏍️ Je suis en route", "destinataire",
+     "{salut}, je suis en route avec votre colis ({colis}). J'arrive bientôt, merci de rester joignable ! - {entreprise}"),
+    ("arrive", "📍 Je suis arrivé", "destinataire",
+     "{salut}, je suis arrivé pour la livraison. Pouvez-vous me dire où vous êtes ? - {entreprise}"),
+    ("retard", "⏳ Petit retard", "destinataire",
+     "{salut}, petit retard sur la livraison (circulation). J'arrive dans quelques minutes, merci de votre patience. - {entreprise}"),
+    ("livre", "✅ Livré, merci", "client",
+     "{salut}, votre colis a bien été livré. Merci de votre confiance ! N'hésitez pas à nous recontacter. - {entreprise}"),
+]
+
+
+def liens_messages(l):
+    sortie = []
+    entreprise = nom_entreprise()
+    for _, libelle, cible, texte in MESSAGES:
+        if cible == "destinataire" and l["destinataire_tel"]:
+            tel, nom = l["destinataire_tel"], l["destinataire_nom"]
+        else:
+            tel, nom = l["client_tel"], l["client_nom"]
+        n = tel_wa(tel)
+        if not n:
+            continue
+        msg = texte.format(salut=f"Bonjour {nom}" if nom else "Bonjour", colis=l["colis"] or "colis",
+                           numero=l["numero"], prix=fcfa(l["prix_course"]), entreprise=entreprise)
+        sortie.append((libelle, f"https://wa.me/{n}?text={quote(msg)}"))
+    if l["statut"] == "livré" and l["statut_paiement"] != "payé" and lien_relance(l):
+        sortie.append(("💰 Rappel de paiement", lien_relance(l)))
+    return sortie
+
+
+app.jinja_env.globals["liens_messages"] = liens_messages
+
+
+# ===================== V7 : sauvegarde automatique =====================
+import re
+import threading
+from flask import send_file
+
+DOSSIER_SAUVEGARDE = os.path.join(DONNEES, "sauvegardes")  # copie locale (toujours active)
+JOURS_GARDES = 30
+MOTIF = r"livraisons_\d{4}-\d{2}-\d{2}\.db"
+_VERROU_SAUVEGARDE = threading.Lock()
+
+
+def dossiers_sauvegarde():
+    """Dossier local + éventuellement un dossier synchronisé (OneDrive, Google Drive...)."""
+    dossiers = [DOSSIER_SAUVEGARDE]
+    sup = os.environ.get("SAUVEGARDE_DOSSIER", "").strip().strip('"')
+    if sup:
+        dossiers.append(sup)
+    return dossiers
+
+
+def nettoyer_sauvegardes(dossier):
+    limite = time.time() - JOURS_GARDES * 86400
+    for f in os.listdir(dossier):
+        p = os.path.join(dossier, f)
+        if re.fullmatch(MOTIF, f) and os.path.isfile(p) and os.path.getmtime(p) < limite:
+            os.remove(p)
+
+
+def creer_copie_verifiee(dossier, prefixe):
+    """Crée une copie SQLite cohérente et vérifie son intégrité avant de la garder."""
+    fd, temporaire = tempfile.mkstemp(prefix=prefixe, suffix=".tmp", dir=dossier)
+    os.close(fd)
+    try:
+        src = sqlite3.connect(DB, timeout=30)
+        try:
+            dst = sqlite3.connect(temporaire, timeout=30)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+
+        controle = sqlite3.connect(temporaire, timeout=30)
+        try:
+            resultat = controle.execute("PRAGMA quick_check").fetchone()
+        finally:
+            controle.close()
+        if not resultat or resultat[0] != "ok":
+            detail = resultat[0] if resultat else "aucun résultat"
+            raise sqlite3.DatabaseError(f"Copie non valide : {detail}")
+        return temporaire
+    except Exception:
+        try:
+            os.remove(temporaire)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def sauvegarder():
+    """Copie cohérente de la base (même pendant que l'application tourne). Un fichier par jour."""
+    nom = f"livraisons_{datetime.now():%Y-%m-%d}.db"
+    resultats = []
+    with _VERROU_SAUVEGARDE:
+        for dossier in dossiers_sauvegarde():
+            temporaire = None
+            try:
+                os.makedirs(dossier, exist_ok=True)
+                cible = os.path.join(dossier, nom)
+                temporaire = creer_copie_verifiee(dossier, nom + ".")
+                os.replace(temporaire, cible)
+                temporaire = None
+                nettoyer_sauvegardes(dossier)
+                resultats.append((dossier, True, "Copie créée et vérifiée."))
+            except Exception as e:  # une destination en panne ne doit pas bloquer les autres
+                log.exception("Sauvegarde impossible dans %s", dossier)
+                resultats.append((dossier, False, f"{type(e).__name__}: {e}"))
+            finally:
+                if temporaire and os.path.exists(temporaire):
+                    try:
+                        os.remove(temporaire)
+                    except OSError:
+                        log.warning("Fichier temporaire de sauvegarde à supprimer manuellement : %s", temporaire)
+    return resultats
+
+
+def signature_fichiers_base():
+    """Suit aussi le WAL : des écritures récentes peuvent ne pas toucher livraisons.db."""
+    signature = []
+    for chemin in (DB, DB + "-wal"):
+        try:
+            stat = os.stat(chemin)
+            signature.append((stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            signature.append(None)
+    return tuple(signature)
+
+
+def boucle_sauvegarde():
+    """Toutes les 30 minutes : sauvegarde si la base a changé depuis la dernière copie."""
+    derniere_signature = None
+    while True:
+        try:
+            signature = signature_fichiers_base()
+            if os.path.exists(DB) and signature != derniere_signature:
+                resultats = sauvegarder()
+                if resultats and all(ok for _, ok, _ in resultats):
+                    # Garder la signature prise avant la copie afin de détecter aussi
+                    # une écriture qui arriverait pendant la sauvegarde.
+                    derniere_signature = signature
+        except Exception:
+            log.exception("Sauvegarde automatique")
+        time.sleep(1800)
+
+
+def lister_sauvegardes(dossier):
+    if not os.path.isdir(dossier):
+        return []
+    sortie = []
+    for f in sorted(os.listdir(dossier), reverse=True):
+        if re.fullmatch(MOTIF, f):
+            p = os.path.join(dossier, f)
+            sortie.append({"nom": f, "ko": round(os.path.getsize(p) / 1024),
+                           "date": datetime.fromtimestamp(os.path.getmtime(p)).strftime("%d/%m/%Y %H:%M")})
+    return sortie
+
+
+PAGE_SAUV = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="card"><h2>💾 Sauvegardes</h2>
+<p class="mut">La base est copiée automatiquement au démarrage puis toutes les 30 minutes si elle a changé.
+Chaque copie est vérifiée avant d’être conservée. Une copie par jour est gardée {{ jours }} jours.</p>
+<form method="post"><button>Sauvegarder maintenant</button>
+<a class="btn sec" href="{{ url_for('telecharger_base') }}">Télécharger une copie</a></form>
+{% if resultats %}<p>{% for d, ok, err in resultats %}{{ '✅' if ok else '❌' }} {{ d }} — {{ err }}<br>{% endfor %}</p>{% endif %}
+{% if un_seul %}<p><b>⚠️ Cette copie est sur le même PC.</b> Si le PC tombe en panne ou est perdu, elle disparaît aussi.
+Ajoute un dossier synchronisé (OneDrive ou Google Drive) avec la commande <code>setx SAUVEGARDE_DOSSIER "C:\\chemin\\vers\\ton\\dossier"</code>.</p>{% endif %}
+</div>
+{% for d in dossiers %}<div class="card"><h2>{{ d.chemin }}</h2>
+{% if d.fichiers %}<div class="scroll"><table><tr><th>Fichier</th><th>Dernière copie</th><th>Taille</th></tr>
+{% for f in d.fichiers %}<tr><td>{{ f.nom }}</td><td>{{ f.date }}</td><td>{{ f.ko }} Ko</td></tr>{% endfor %}</table></div>
+{% else %}<p class="mut">Aucune sauvegarde dans ce dossier pour le moment.</p>{% endif %}</div>{% endfor %}
+<div class="card"><h2>Restaurer une sauvegarde</h2><ol>
+<li>Arrête proprement l’application avec Ctrl+C dans sa fenêtre noire.</li>
+<li>Fais une copie du dossier de données complet avant toute manipulation.</li>
+<li>Remplace le fichier <code>{{ chemin_db }}</code> par la sauvegarde choisie.</li>
+<li>Relance avec <code>lancer.bat</code>. Si des fichiers <code>-wal</code> ou <code>-shm</code> sont encore présents après l’arrêt, ne remplace pas la base et demande de l’aide.</li></ol></div>
+""")
+
+
+@app.route("/sauvegardes", methods=["GET", "POST"])
+def sauvegardes():
+    resultats = sauvegarder() if request.method == "POST" else None
+    dossiers = [{"chemin": d, "fichiers": lister_sauvegardes(d)} for d in dossiers_sauvegarde()]
+    return render_template_string(PAGE_SAUV, dossiers=dossiers, resultats=resultats,
+                                  un_seul=len(dossiers) == 1, jours=JOURS_GARDES, chemin_db=DB)
+
+
+@app.route("/sauvegardes/telecharger")
+def telecharger_base():
+    tmp = None
+    try:
+        tmp = creer_copie_verifiee(DOSSIER, "livraisons_export_")
+        reponse = send_file(tmp, as_attachment=True,
+                            download_name=f"livraisons_{datetime.now():%Y-%m-%d}.db", max_age=0)
+        reponse.call_on_close(lambda: os.path.exists(tmp) and os.remove(tmp))
+        return reponse
+    except Exception:
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+# ===================== V8 : résumé hebdomadaire et objectif =====================
+from datetime import date
+
+JOURS_COURTS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+
+
+def lundi(d):
+    return d - timedelta(days=d.weekday())
+
+
+def reglage(cle, defaut=""):
+    with db() as con:
+        r = con.execute("SELECT valeur FROM reglages WHERE cle=?", (cle,)).fetchone()
+    return r["valeur"] if r else defaut
+
+
+def entreprise_infos():
+    infos = dict(ENTREPRISE)
+    with db() as con:
+        regles = {r["cle"]: r["valeur"] for r in con.execute(
+            "SELECT cle, valeur FROM reglages WHERE cle LIKE 'entreprise_%'").fetchall()}
+    for champ in infos:
+        infos[champ] = regles.get("entreprise_" + champ, infos[champ])
+    return infos
+
+
+def nom_entreprise():
+    return entreprise_infos()["nom"].split(" - ")[0]
+
+
+PAGE_PARAMETRES = BASE.replace("{% block corps %}{% endblock %}", """
+<style>.par-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.par-shortcuts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.par-link{display:block;padding:14px;border:1px solid var(--bord);border-radius:12px;background:var(--bg);color:var(--txt);text-decoration:none}.par-link b{display:block;margin-bottom:4px}.par-link:hover{border-color:var(--vert2);background:var(--soft)}
+@media(max-width:700px){.par-grid,.par-shortcuts{grid-template-columns:1fr}}</style>
+<div class="entete"><div><h1>⚙️ Paramètres</h1><p>Personnalise les informations de ton entreprise et retrouve les réglages importants.</p></div></div>
+{% if msg %}<div class="card"><span class="pastille {{ 'rouge' if erreur else '' }}">{{ msg }}</span></div>{% endif %}
+<form method="post" class="card"><h2>Identité affichée dans l’application</h2><div class="par-grid">
+ <label>Nom de l’entreprise<input name="nom" value="{{ infos.nom }}" required maxlength="100" placeholder="Ex. LIR - Livraison rapide"></label>
+ <label>Responsable<input name="responsable" value="{{ infos.responsable }}" maxlength="100"></label>
+ <label>Téléphone professionnel<input name="tel" value="{{ infos.tel }}" maxlength="120" placeholder="Numéro de contact"></label>
+ <label>Ville / zone d’activité<input name="ville" value="{{ infos.ville }}" maxlength="100" placeholder="Ouagadougou, Burkina Faso"></label>
+ <label>Objectif hebdomadaire (FCFA)<input name="objectif" type="number" min="0" step="1" value="{{ objectif }}" placeholder="0 = pas d’objectif"></label>
+ </div><p><button>Enregistrer les paramètres</button></p><p class="mut">Ces informations apparaissent sur les factures et les messages envoyés. L’objectif est aussi repris dans le résumé de la semaine.</p></form>
+<div class="card"><h2>État et raccourcis</h2><div class="par-shortcuts">
+ <a class="par-link" href="{{ url_for('sauvegardes') }}"><b>💾 Sauvegardes</b><span class="mut">Créer et télécharger une copie de la base.</span></a>
+ <a class="par-link" href="{{ url_for('whatsapp') }}"><b>🤖 WhatsApp · {{ 'configuré' if wa_ok else 'à configurer' }}</b><span class="mut">Vérifier le canal et le mode d’envoi.</span></a>
+ <a class="par-link" href="{{ url_for('semaine') }}"><b>🎯 Objectif hebdomadaire</b><span class="mut">Suivre la progression de la semaine.</span></a>
+ </div><p class="mut" style="margin-top:13px">Clé IA : {{ 'configurée' if ia_ok else 'non configurée' }} · Identifiants WhatsApp : {{ 'configurés' if wa_ok else 'absents' }} · Mode WhatsApp : {{ wa_mode }} · Adresse publique : {{ 'définie' if url_publique else 'non définie' }}.</p>
+<p class="mut">Accès administrateur : {{ 'mot de passe configuré' if admin_pass_ok else 'limité à ce PC' }} · Connexions partenaires/livreurs depuis Internet : {{ 'ouvertes' if boutique_publique else 'désactivées' }}.</p>
+<p class="mut">Les clés secrètes (IA, WhatsApp) restent dans les variables d’environnement de Windows : ne les colle pas dans cette page.</p></div>
+""")
+
+
+@app.route("/parametres", methods=["GET", "POST"])
+def parametres():
+    msg = request.args.get("msg", "")[:200]
+    erreur = request.args.get("erreur", "") == "1"
+    if request.method == "POST":
+        infos = {
+            "nom": request.form.get("nom", "").strip()[:100],
+            "responsable": request.form.get("responsable", "").strip()[:100],
+            "tel": request.form.get("tel", "").strip()[:120],
+            "ville": request.form.get("ville", "").strip()[:100],
+        }
+        objectif = "".join(ch for ch in request.form.get("objectif", "") if ch.isdigit()) or "0"
+        if not infos["nom"] or len(objectif) > 15:
+            return redirect(url_for("parametres", msg="Indique un nom d’entreprise et un objectif valide.", erreur=1))
+        with db() as con:
+            con.executemany("INSERT INTO reglages(cle,valeur) VALUES(?,?) "
+                            "ON CONFLICT(cle) DO UPDATE SET valeur=excluded.valeur",
+                            [("entreprise_" + k, v) for k, v in infos.items()] + [("objectif_hebdo", objectif)])
+        return redirect(url_for("parametres", msg="Paramètres enregistrés."))
+    infos = entreprise_infos()
+    try:
+        objectif = int(reglage("objectif_hebdo", "0") or 0)
+    except ValueError:
+        objectif = 0
+    return render_template_string(PAGE_PARAMETRES, infos=infos, objectif=objectif, msg=msg, erreur=erreur,
+                                  wa_ok=wa_configure(), ia_ok=bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")),
+                                  wa_mode="manuel" if os.environ.get("WA_MODE", "auto").lower() == "manuel" else "automatique",
+                                  url_publique=bool(os.environ.get("URL_PUBLIQUE")),
+                                  admin_pass_ok=bool(os.environ.get("APP_MOT_DE_PASSE")),
+                                  boutique_publique=os.environ.get("BOUTIQUE_PUBLIQUE", "") == "1")
+
+
+def variation(a, b):
+    if not b:
+        return "nouveau" if a else "-"
+    return f"{(a - b) / b * 100:+.0f} %"
+
+
+def stats_semaine(debut):
+    d0, d1 = debut.isoformat(), (debut + timedelta(days=6)).isoformat()
+    ok = "statut!='annulé' AND date(cree_le) BETWEEN ? AND ?"
+    with db() as con:
+        k = con.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(prix_course),0) rev, COALESCE(SUM(frais),0) fr, "
+            "COALESCE(SUM(distance_km),0) km, COALESCE(SUM(CASE WHEN statut_paiement='payé' THEN prix_course END),0) enc "
+            f"FROM livraisons WHERE {ok}", (d0, d1)).fetchone()
+        annul = con.execute("SELECT COUNT(*) FROM livraisons WHERE statut IN ('annulé','injoignable') "
+                            "AND date(cree_le) BETWEEN ? AND ?", (d0, d1)).fetchone()[0]
+        clients = con.execute(
+            f"SELECT MAX(client_nom) nom, COUNT(*) n, COALESCE(SUM(prix_course),0) total FROM livraisons WHERE {ok} "
+            f"GROUP BY {CLE} ORDER BY n DESC, total DESC LIMIT 3", (d0, d1)).fetchall()
+        quartiers = con.execute(
+            f"SELECT MIN(livraison_quartier) l, COUNT(*) n FROM livraisons WHERE {ok} AND livraison_quartier!='' "
+            "GROUP BY LOWER(livraison_quartier) ORDER BY n DESC LIMIT 3", (d0, d1)).fetchall()
+        produits = con.execute(
+            f"SELECT MIN(produit) l, COUNT(*) n FROM livraisons WHERE {ok} AND produit!='' "
+            "GROUP BY LOWER(produit) ORDER BY n DESC LIMIT 3", (d0, d1)).fetchall()
+        nouveaux = con.execute(
+            f"SELECT COUNT(*) FROM (SELECT MIN(date(cree_le)) p FROM livraisons WHERE statut!='annulé' GROUP BY {CLE}) "
+            "WHERE p BETWEEN ? AND ?", (d0, d1)).fetchone()[0]
+        parjour = {r["j"]: r for r in con.execute(
+            f"SELECT date(cree_le) j, COUNT(*) n, SUM(prix_course) r, SUM(frais) f FROM livraisons WHERE {ok} GROUP BY j",
+            (d0, d1))}
+    jours = []
+    for i in range(7):
+        j = (debut + timedelta(days=i)).isoformat()
+        r = parjour.get(j)
+        rev, fr = ((r["r"] or 0), (r["f"] or 0)) if r else (0, 0)
+        jours.append({"label": f"{JOURS_COURTS[i]} {j[8:]}", "rev": rev, "ben": rev - fr, "n": r["n"] if r else 0})
+    return {"n": k["n"], "rev": k["rev"], "fr": k["fr"], "ben": k["rev"] - k["fr"], "km": round(k["km"]),
+            "enc": k["enc"], "annul": annul, "nouveaux": nouveaux, "jours": jours,
+            "clients": [{"nom": r["nom"] or "Client sans nom", "n": r["n"], "total": r["total"]} for r in clients],
+            "quartiers": [{"l": r["l"], "n": r["n"]} for r in quartiers],
+            "produits": [{"l": r["l"], "n": r["n"]} for r in produits]}
+
+
+def impayes_total():
+    with db() as con:
+        r = con.execute("SELECT COUNT(*) n, COALESCE(SUM(prix_course),0) s FROM livraisons "
+                        "WHERE statut='livré' AND statut_paiement!='payé'").fetchone()
+    return r["n"], r["s"]
+
+
+def objectif_semaine():
+    objectif = int(reglage("objectif_hebdo", "0") or 0)
+    if not objectif:
+        return {"objectif": 0}
+    rev = stats_semaine(lundi(date.today()))["rev"]
+    return {"objectif": objectif, "rev": rev, "pct": min(100, round(100 * rev / objectif)),
+            "reste": max(0, objectif - rev)}
+
+
+app.jinja_env.globals["objectif_semaine"] = objectif_semaine
+
+
+def texte_resume(st, prec, objectif, imp, debut):
+    fin = debut + timedelta(days=6)
+    entreprise = nom_entreprise()
+    pl = lambda n: "s" if n > 1 else ""
+    t = [f"📊 Résumé {entreprise} - semaine du {debut:%d/%m} au {fin:%d/%m}",
+         f"🏍️ Courses : {st['n']} ({variation(st['n'], prec['n'])} vs semaine précédente)",
+         f"💰 Revenus : {fcfa(st['rev'])} F ({variation(st['rev'], prec['rev'])})",
+         f"⛽ Frais : {fcfa(st['fr'])} F",
+         f"✅ Bénéfice : {fcfa(st['ben'])} F"]
+    if objectif:
+        t.append(f"🎯 Objectif : {round(100 * st['rev'] / objectif)} % de {fcfa(objectif)} F")
+    if st["clients"]:
+        c = st["clients"][0]
+        t.append(f"⭐ Meilleur client : {c['nom']} ({c['n']} course{pl(c['n'])})")
+    if st["quartiers"]:
+        t.append(f"📍 Quartier le plus livré : {st['quartiers'][0]['l']}")
+    if st["produits"]:
+        t.append(f"📦 Produit le plus demandé : {st['produits'][0]['l']}")
+    if imp[0]:
+        t.append(f"⚠️ À encaisser : {fcfa(imp[1])} F ({imp[0]} course{pl(imp[0])})")
+    return "\n".join(t)
+
+
+PAGE_SEMAINE = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="card"><div class="ligne" style="border:0;flex-wrap:wrap">
+<a class="btn sec" href="{{ url_for('semaine', d=prec_d) }}">← Précédente</a>
+<h2 style="margin:0">Semaine du {{ debut_aff }} au {{ fin_aff }}</h2>
+<span><a class="btn sec" href="{{ url_for('semaine') }}">Cette semaine</a> <a class="btn sec" href="{{ url_for('semaine', d=suiv_d) }}">Suivante →</a></span></div></div>
+<div class="card"><h2>🎯 Objectif de revenus de la semaine</h2>
+{% if objectif %}<div class="barre"><div style="width:{{ pct }}%"></div></div>
+<p>{{ st.rev|fcfa }} F sur {{ objectif|fcfa }} F ({{ pct_reel }} %) · {% if reste %}reste {{ reste|fcfa }} F{% else %}objectif atteint 🎉{% endif %}</p>
+{% else %}<p class="mut">Fixe un objectif pour suivre ta progression sur le tableau de bord.</p>{% endif %}
+<form method="post" class="ligne" style="border:0;justify-content:flex-start"><input name="objectif" placeholder="Objectif en FCFA (ex : 50000)" value="{{ objectif or '' }}" style="max-width:280px">
+<input type="hidden" name="d" value="{{ debut_iso }}"><button>Enregistrer l'objectif</button></form></div>
+<div class="card"><h2>Chiffres de la semaine</h2><div class="stats">
+<div class="stat"><b>{{ st.n }}</b><span>courses ({{ var_n }})</span></div>
+<div class="stat"><b>{{ st.rev|fcfa }} F</b><span>revenus ({{ var_rev }})</span></div>
+<div class="stat"><b>{{ st.fr|fcfa }} F</b><span>frais</span></div>
+<div class="stat"><b>{{ st.ben|fcfa }} F</b><span>bénéfice</span></div>
+<div class="stat"><b>{{ st.enc|fcfa }} F</b><span>déjà encaissé</span></div>
+<div class="stat"><b>{{ st.nouveaux }}</b><span>nouveaux clients</span></div>
+<div class="stat"><b>{{ st.km }} km</b><span>distance</span></div>
+<div class="stat"><b>{{ st.annul }}</b><span>annulées / injoignables</span></div></div></div>
+<div class="card"><h2>Jour par jour</h2><div class="chart"><canvas id="gs"></canvas></div></div>
+<div class="grille">
+<div class="card"><h2>⭐ Meilleurs clients</h2>{% for c in st.clients %}<div class="ligne"><span>{{ c.nom }}</span><span class="tag">{{ c.n }} course{{ 's' if c.n > 1 }} · {{ c.total|fcfa }} F</span></div>{% else %}<p class="mut">Aucune course.</p>{% endfor %}</div>
+<div class="card"><h2>📍 Quartiers</h2>{% for q in st.quartiers %}<div class="ligne"><span>{{ q.l }}</span><span class="tag">{{ q.n }}</span></div>{% else %}<p class="mut">Pas de données.</p>{% endfor %}</div>
+<div class="card"><h2>📦 Produits</h2>{% for p in st.produits %}<div class="ligne"><span>{{ p.l }}</span><span class="tag">{{ p.n }}</span></div>{% else %}<p class="mut">Pas de données.</p>{% endfor %}</div>
+</div>
+<div class="card"><h2>⚠️ À encaisser (toutes semaines)</h2><p>{{ imp[1]|fcfa }} F sur {{ imp[0] }} course{{ 's' if imp[0] > 1 }}. <a href="{{ url_for('accueil') }}">Voir les relances</a></p></div>
+<div class="card"><h2>📤 Message récapitulatif</h2>
+<textarea id="resume" rows="10" readonly>{{ texte }}</textarea>
+<p><button type="button" onclick="copier(this)">Copier</button> <a class="btn" target="_blank" href="{{ lien_wa }}">Envoyer sur WhatsApp</a></p></div>
+<script>
+const J={{ jours|tojson }};
+if(window.Chart){new Chart(document.getElementById('gs'),{type:'bar',data:{labels:J.map(x=>x.label),datasets:[{label:'Revenus',data:J.map(x=>x.rev),backgroundColor:'#0a7d3c',borderRadius:6},{label:'Bénéfice',data:J.map(x=>x.ben),backgroundColor:'#9bd8b4',borderRadius:6}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'}}}});}
+function copier(b){const t=document.getElementById('resume');t.select();document.execCommand('copy');b.textContent='Copié ✅';}
+</script>
+""")
+
+
+@app.route("/semaine", methods=["GET", "POST"])
+def semaine():
+    try:
+        ref = date.fromisoformat(request.values.get("d", ""))
+    except ValueError:
+        ref = date.today()
+    debut = lundi(ref)
+    if request.method == "POST":
+        obj = "".join(ch for ch in request.form.get("objectif", "") if ch.isdigit())
+        with db() as con:
+            con.execute("INSERT INTO reglages(cle,valeur) VALUES('objectif_hebdo',?) "
+                        "ON CONFLICT(cle) DO UPDATE SET valeur=excluded.valeur", (obj or "0",))
+        return redirect(url_for("semaine", d=debut.isoformat()))
+    st, prec = stats_semaine(debut), stats_semaine(debut - timedelta(days=7))
+    objectif, imp = int(reglage("objectif_hebdo", "0") or 0), impayes_total()
+    texte = texte_resume(st, prec, objectif, imp, debut)
+    pct_reel = round(100 * st["rev"] / objectif) if objectif else 0
+    return render_template_string(
+        PAGE_SEMAINE, st=st, objectif=objectif, pct=min(100, pct_reel), pct_reel=pct_reel,
+        reste=max(0, objectif - st["rev"]), imp=imp, texte=texte, jours=st["jours"],
+        lien_wa="https://wa.me/?text=" + quote(texte),
+        var_n=variation(st["n"], prec["n"]), var_rev=variation(st["rev"], prec["rev"]),
+        debut_aff=f"{debut:%d/%m}", fin_aff=f"{debut + timedelta(days=6):%d/%m}", debut_iso=debut.isoformat(),
+        prec_d=(debut - timedelta(days=7)).isoformat(), suiv_d=(debut + timedelta(days=7)).isoformat())
+
+
+# ===================== V9 : répartition des commandes entre livreurs =====================
+ECART_EGALITE_KM = 1.5  # en dessous de cet écart, deux livreurs sont considérés à égalité -> le moins occupé gagne
+
+
+def seed_livreurs(con):
+    """Au premier lancement : 4 livreurs à renommer (page Livreurs)."""
+    if con.execute("SELECT COUNT(*) FROM livreurs").fetchone()[0] == 0:
+        con.executemany("INSERT INTO livreurs(nom, tel, base, actif) VALUES (?,?,?,1)",
+                        [("Moi (Pissy)", "", "Pissy"), ("Ami 1 (Patte d'Oie)", "", "Patte d'Oie"),
+                         ("Ami 2 (Patte d'Oie)", "", "Patte d'Oie"), ("Ami 3 (Tanghin)", "", "Tanghin")])
+
+
+def champs_dynamiques():
+    with db() as con:
+        noms = [r["nom"] for r in con.execute("SELECT nom FROM livreurs ORDER BY id")]
+    return [(c, l, g, [""] + noms) if c == "livreur" else (c, l, g, o) for c, l, g, o in CHAMPS]
+
+
+# Nominatim : une seule requête à la fois (sinon la limite de 1 requête/seconde est dépassée)
+_verrou_geo = threading.Lock()
+_geocoder_base = geocoder
+
+
+def geocoder(texte):
+    with _verrou_geo:
+        return _geocoder_base(texte)
+
+
+def classer_livreurs(collecte, quartier):
+    pos, approx = geocoder(collecte), False
+    if not pos and quartier and quartier != collecte:
+        pos, approx = geocoder(quartier), True
+    if not pos:
+        raise LookupError(f"Lieu de collecte introuvable : {collecte}")
+    with db() as con:
+        actifs = con.execute("SELECT * FROM livreurs WHERE actif=1 ORDER BY id").fetchall()
+        charges = {r["livreur"]: r["n"] for r in con.execute(
+            "SELECT livreur, COUNT(*) n FROM livraisons WHERE statut IN ('en attente','collecté') "
+            "AND livreur!='' GROUP BY livreur")}
+    liste = []
+    for lv in actifs:
+        base = geocoder(lv["base"])
+        if base:
+            liste.append({"nom": lv["nom"], "base": lv["base"], "km": round(vol_oiseau_km(pos, base) * 1.3, 1),
+                          "en_cours": charges.get(lv["nom"], 0)})
+    if not liste:
+        raise LookupError("Aucun livreur disponible dont la base est localisable (voir la page Livreurs)")
+    liste.sort(key=lambda x: x["km"])
+    proches = [x for x in liste if x["km"] <= liste[0]["km"] + ECART_EGALITE_KM]
+    meilleur = min(proches, key=lambda x: (x["en_cours"], x["km"]))
+    liste.remove(meilleur)
+    liste.insert(0, meilleur)
+    return liste, approx
+
+
+@app.route("/livreurs/suggestion", methods=["POST"])
+def suggestion_livreur():
+    d = request.get_json(silent=True) or {}
+    try:
+        liste, approx = classer_livreurs(d.get("a", ""), d.get("qa", ""))
+        return jsonify(livreurs=liste, approx=approx)
+    except LookupError as e:
+        return jsonify(erreur=str(e)), 404
+    except Exception as e:
+        return jsonify(erreur=f"Calcul impossible ({type(e).__name__})"), 500
+
+
+def texte_commande(l):
+    j = lambda *p: ", ".join(x for x in p if x)
+    t = [f"🏍️ Nouvelle commande {l['numero']}"]
+    if l["colis"] or l["produit"]:
+        t.append(f"📦 {j(l['produit'], l['colis'])}")
+    t.append(f"📍 Collecte : {j(l['collecte_lieu'], l['collecte_quartier']) or '-'}")
+    t.append(f"🏁 Livraison : {j(l['livraison_adresse'], l['livraison_quartier']) or '-'}")
+    t.append(f"👤 Client : {j(l['client_nom'], l['client_tel']) or '-'}")
+    if l["destinataire_nom"] or l["destinataire_tel"]:
+        t.append(f"👥 Destinataire : {j(l['destinataire_nom'], l['destinataire_tel'])}")
+    t.append(f"💰 Course : {fcfa(l['prix_course'])} F ({l['mode_paiement'] or 'paiement à préciser'})")
+    t.append(f"💵 Encaissement de la course prévu par : {l['encaisse_course_prevu'] or 'À préciser'}")
+    if l["valeur_produit"]:
+        t.append(f"🛒 Produit à avancer / encaisser : {fcfa(l['valeur_produit'])} F")
+    if l["remarques"]:
+        t.append(f"📝 {l['remarques']}")
+    return "\n".join(t)
+
+
+def lien_dispatch(l):
+    nom = l["livreur"]
+    if not nom:
+        return None
+    with db() as con:
+        r = con.execute("SELECT tel FROM livreurs WHERE nom=?", (nom,)).fetchone()
+    n = tel_wa(r["tel"]) if r else ""
+    if not n:
+        return None
+    return (f"📲 Envoyer la commande à {nom}", f"https://wa.me/{n}?text={quote(texte_commande(l))}")
+
+
+_liens_messages_base = liens_messages
+
+
+def liens_messages(l):
+    envoi = lien_dispatch(l)
+    reste = _liens_messages_base(l)
+    return ([envoi] + reste) if envoi else reste
+
+
+app.jinja_env.globals["liens_messages"] = liens_messages
+
+PAGE_LIVREURS = BASE.replace("{% block corps %}{% endblock %}", """
+<style>
+.rd-head{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}.rd-head h1{margin:0;font-size:1.7rem;letter-spacing:-.03em}.rd-head p{margin:5px 0 0;color:var(--mut)}
+.rd-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:16px}.rd-stats .stat b{font-size:1.35rem}
+.rd-tabs{display:flex;gap:8px;overflow-x:auto;padding:2px 1px 12px}.rd-tab{display:flex;flex:none;align-items:center;gap:7px;padding:9px 12px;border:1px solid var(--bord);border-radius:12px;background:var(--card);color:var(--mut);text-decoration:none;font-size:.84rem;font-weight:650}.rd-tab:hover,.rd-tab.on{border-color:var(--vert2);background:var(--soft);color:var(--vert)}.rd-tab em{font-style:normal;padding:2px 7px;border-radius:999px;background:var(--bg);font-size:.73rem}
+.rd-filter{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;align-items:end;padding:13px 15px;margin-bottom:10px}.rd-filter label{margin:0}.rd-meta{display:flex;justify-content:space-between;align-items:center;gap:9px;color:var(--mut);font-size:.84rem;padding:3px 2px 11px}.rd-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.rd-card{min-width:0;padding:15px;background:var(--card);border:1px solid var(--bord);border-radius:15px;box-shadow:var(--ombre)}.rd-top,.rd-bottom{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap}.rd-person{display:flex;align-items:center;gap:10px;min-width:0}.rd-avatar{width:43px;height:43px;display:grid;place-items:center;flex:none;border-radius:13px;background:var(--soft);font-size:1.25rem}.rd-name{min-width:0}.rd-name b{display:block;font-size:1.05rem;overflow-wrap:anywhere}.rd-name small{display:block;color:var(--mut);margin-top:2px;overflow-wrap:anywhere}.rd-status{display:flex;gap:6px;flex-wrap:wrap}.rd-status .pastille{white-space:nowrap}.rd-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin:13px 0}.rd-kpi{min-width:0;padding:9px 8px;border:1px solid var(--bord);border-radius:10px;background:var(--bg)}.rd-kpi small{display:block;color:var(--mut);font-size:.66rem;font-weight:750;letter-spacing:.035em;text-transform:uppercase}.rd-kpi b{display:block;margin-top:3px;font-size:.95rem;overflow-wrap:anywhere}.rd-kpi span{display:block;color:var(--mut);font-size:.68rem;margin-top:2px}.rd-links{display:flex;gap:6px;flex-wrap:wrap}.rd-links .btn{padding:7px 10px;font-size:.78rem}.rd-foot{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}.rd-edit{margin-top:11px;border-top:1px solid var(--bord);padding-top:9px}.rd-edit summary{cursor:pointer;color:var(--vert);font-weight:650;font-size:.84rem}.rd-edit form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 10px;align-items:end;margin-top:8px}.rd-edit label{margin:3px 0}.rd-edit .rd-wide{grid-column:1/-1}.rd-available{display:flex;align-items:center;gap:7px;color:var(--mut);font-size:.84rem}.rd-available input{width:auto}.rd-warning{border-color:rgba(240,165,0,.45)}.rd-empty{text-align:center;padding:30px 12px}.rd-add{scroll-margin-top:20px}.rd-add-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;align-items:end}.rd-add-grid label{margin:0}
+@media(max-width:850px){.rd-grid{grid-template-columns:1fr}.rd-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.rd-kpis{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:520px){.rd-head h1{font-size:1.45rem}.rd-head>.btn{width:100%;justify-content:center}.rd-filter{grid-template-columns:1fr 1fr}.rd-filter label{grid-column:1/-1}.rd-card{padding:12px}.rd-kpis{gap:5px}.rd-kpi{padding:8px 5px}.rd-kpi b{font-size:.82rem}.rd-kpi small{font-size:.6rem}.rd-edit form,.rd-add-grid{grid-template-columns:1fr}.rd-edit .rd-wide{grid-column:auto}.rd-links{width:100%}.rd-links .btn{flex:1;justify-content:center}}
+</style>
+<header class="rd-head"><div><h1>🏍️ Espace livreurs</h1><p>Disponibilités, charge, activité et versements de ton équipe au même endroit.</p></div><a class="btn" href="#ajouter">＋ Ajouter un livreur</a></header>
+{% if msg %}<div class="card"><span class="pastille {{ 'rouge' if erreur else '' }}">{{ msg }}</span></div>{% endif %}
+<section class="rd-stats">
+ <div class="stat"><b>{{ resume.total }}</b><span>livreurs dans l’équipe</span></div>
+ <div class="stat"><b>{{ resume.actifs }}</b><span>disponibles pour les nouvelles courses</span></div>
+ <div class="stat ambre"><b>{{ resume.en_cours }}</b><span>livraisons en cours</span></div>
+ <div class="stat"><b>{{ resume.versements|fcfa }} F</b><span>versements notés ce mois</span></div>
+</section>
+<nav class="rd-tabs" aria-label="Filtres de livreurs">
+ {% for f in filtres %}<a class="rd-tab {{ 'on' if vue == f.id else '' }}" href="{{ url_for('livreurs', vue=f.id, q=q) }}">{{ f.icone }} {{ f.nom }} <em>{{ f.n }}</em></a>{% endfor %}
+</nav>
+<form class="card rd-filter" method="get" action="{{ url_for('livreurs') }}">
+ <input type="hidden" name="vue" value="{{ vue }}">
+ <label>🔎 Rechercher<input type="search" name="q" value="{{ q }}" placeholder="Nom, téléphone ou quartier de base…"></label>
+ <button type="submit">Rechercher</button><a class="btn sec" href="{{ url_for('livreurs', vue=vue) }}">Effacer</a>
+</form>
+{% if a_configurer %}<section class="card rd-warning"><h2>⚙️ Profils à compléter</h2><p class="mut">Une base aide au choix du livreur le plus proche ; un numéro WhatsApp permet de lui transmettre la commande.</p>
+ {% for l in a_configurer %}<div class="ligne"><span><b>{{ l.nom }}</b> · {{ l.manque|join(' et ') }}</span><a class="btn sec" href="#livreur-{{ l.id }}">Voir le profil</a></div>{% endfor %}</section>{% endif %}
+<div class="rd-meta"><span><b>{{ total }}</b> livreur{{ '' if total == 1 else 's' }} affiché{{ '' if total == 1 else 's' }}{% if q %} pour « {{ q }} »{% endif %}</span><span>{{ resume.semaine_n }} livraison{{ '' if resume.semaine_n == 1 else 's' }} terminée{{ '' if resume.semaine_n == 1 else 's' }} cette semaine</span></div>
+<section class="rd-grid">
+{% for l in liste %}<article class="rd-card" id="livreur-{{ l.id }}">
+ <div class="rd-top"><div class="rd-person"><span class="rd-avatar">🏍️</span><div class="rd-name"><b>{{ l.nom }}</b><small>{% if l.base %}📍 {{ l.base }}{% else %}📍 Base à renseigner{% endif %}{% if l.tel %} · {{ l.tel }}{% else %} · WhatsApp à renseigner{% endif %}</small></div></div>
+ <div class="rd-status"><span class="pastille {{ '' if l.actif else 'ambre' }}">{{ 'Disponible' if l.actif else 'En pause' }}</span>{% if l.en_cours >= 2 %}<span class="pastille ambre">{{ l.en_cours }} en cours</span>{% endif %}{% if l.note %}<span class="pastille">★ {{ l.note }}/5 · {{ l.nb_avis }} avis</span>{% endif %}</div></div>
+ <div class="rd-kpis"><div class="rd-kpi"><small>En cours</small><b>{{ l.en_cours }}</b></div><div class="rd-kpi"><small>Livrées · semaine</small><b>{{ l.semaine_n }}</b></div><div class="rd-kpi"><small>Courses brutes</small><b>{{ l.semaine_r|fcfa }} F</b><span>livraisons terminées</span></div><div class="rd-kpi"><small>Versé · mois</small><b>{{ l.verse_mois|fcfa }} F</b></div></div>
+ <div class="rd-foot"><span class="mut">{% if l.derniere %}Dernière course : {{ l.derniere }}{% else %}Aucune course terminée{% endif %}</span><div class="rd-links"><a class="btn sec" href="{{ url_for('fiche_livreur', id=l.id) }}">📋 Fiche</a><a class="btn sec" href="{{ url_for('toutes', livreur=l.nom) }}">Toutes ses livraisons</a><a class="btn sec" href="{{ url_for('toutes', livreur=l.nom, vue='actives') }}">En cours</a>{% if l.wa %}<a class="btn sec" target="_blank" rel="noopener" href="https://wa.me/{{ l.wa }}">WhatsApp</a>{% endif %}<a class="btn" href="{{ url_for('revenus', livreur_id=l.id) }}">＋ Versement</a></div></div>
+ <details class="rd-edit" {{ 'open' if modifier_id == l.id else '' }}><summary>Modifier son profil et sa disponibilité</summary><form method="post" action="{{ url_for('modifier_livreur', id=l.id) }}"><input type="hidden" name="vue" value="{{ vue }}"><input type="hidden" name="q" value="{{ q }}">
+  <label>Nom<input name="nom" value="{{ l.nom }}" required></label><label>WhatsApp<input name="tel" value="{{ l.tel or '' }}" placeholder="70 12 34 56"></label><label class="rd-wide">Base (quartier ou adresse)<input name="base" value="{{ l.base or '' }}" placeholder="Ex. Gounghin"></label>
+  <label class="rd-available rd-wide"><input type="checkbox" name="actif" value="1" {{ 'checked' if l.actif }}> Disponible pour les nouvelles affectations</label><button class="rd-wide">Enregistrer les changements</button></form>
+ {% if l.actif %}<form method="post" action="{{ url_for('supprimer_livreur', id=l.id) }}" onsubmit="return confirm('Mettre {{ l.nom }} en pause ? Son historique et ses paiements seront conservés.')"><input type="hidden" name="vue" value="{{ vue }}"><input type="hidden" name="q" value="{{ q }}"><button class="danger" style="margin-top:8px">Mettre en pause</button></form>{% endif %}</details>
+</article>{% else %}<div class="card rd-empty"><h2>Aucun livreur dans ce filtre</h2><p class="mut">Change de rubrique ou ajoute une personne à l’équipe.</p><a class="btn sec" href="{{ url_for('livreurs') }}">Voir toute l’équipe</a></div>{% endfor %}
+</section>
+<section id="ajouter" class="card rd-add"><h2>Ajouter un livreur à l’équipe</h2><p class="mut">Ajoute son numéro WhatsApp et son quartier de départ pour faciliter l’envoi et l’affectation des courses.</p><form method="post" class="rd-add-grid"><input type="hidden" name="vue" value="{{ vue }}"><input type="hidden" name="q" value="{{ q }}">
+ <label>Nom<input name="nom" required placeholder="Nom du livreur"></label><label>WhatsApp<input name="tel" placeholder="70 12 34 56"></label><label>Base (quartier ou adresse)<input name="base" placeholder="Ex. Gounghin"></label><button>Ajouter le livreur</button></form></section>
+<p class="mut">Les montants des courses sont des prix bruts facturés aux clients, pas le salaire du livreur. Seuls les versements saisis dans Revenus apparaissent dans « Versé · mois ».</p>
+""")
+
+PAGE_FICHE_LIVREUR = BASE.replace("{% block corps %}{% endblock %}", """
+<style>
+.fd-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin:0 0 17px}.fd-head h1{margin:0;font-size:1.65rem;letter-spacing:-.03em}.fd-head p{margin:5px 0 0;color:var(--mut)}.fd-actions{display:flex;gap:7px;flex-wrap:wrap}.fd-actions .btn{font-size:.82rem}
+.fd-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:16px}.fd-columns{display:grid;grid-template-columns:1.25fr .75fr;gap:14px}.fd-contact{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.fd-contact p{margin:5px 0}.fd-list{display:grid;gap:8px}.fd-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--bord)}.fd-row:last-child{border:0}.fd-row-main{min-width:0}.fd-row-main b{display:block;overflow-wrap:anywhere}.fd-row-main small{display:block;color:var(--mut);margin-top:3px}.fd-money{text-align:right;white-space:nowrap}.fd-history{max-height:540px;overflow:auto}.fd-note{padding:11px 13px;border-radius:11px;background:var(--soft);color:var(--mut);font-size:.84rem}.fd-portal{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.fd-portal input{flex:1;min-width:240px}
+@media(max-width:760px){.fd-columns{grid-template-columns:1fr}.fd-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.fd-head h1{font-size:1.4rem}.fd-actions{width:100%}.fd-actions .btn{flex:1;justify-content:center}}
+</style>
+<header class="fd-head"><div><h1>🏍️ {{ livreur.nom }}</h1><p>Fiche d’activité · {{ 'Disponible' if livreur.actif else 'En pause' }}{% if livreur.base %} · 📍 {{ livreur.base }}{% endif %}</p></div><div class="fd-actions"><a class="btn sec" href="{{ url_for('livreurs') }}">← Équipe</a><a class="btn sec" href="{{ url_for('toutes', livreur=livreur.nom) }}">📦 Ses livraisons</a><a class="btn" href="{{ url_for('revenus', livreur_id=livreur.id) }}">＋ Enregistrer un versement</a></div></header>
+<section class="fd-stats">
+ <div class="stat ambre"><b>{{ stats.en_cours }}</b><span>courses en cours</span></div>
+ <div class="stat"><b>{{ stats.semaine_n }}</b><span>livrées cette semaine · {{ stats.semaine_brut|fcfa }} F bruts</span></div>
+ <div class="stat"><b>{{ stats.mois_n }}</b><span>livrées ce mois · {{ stats.mois_brut|fcfa }} F bruts</span></div>
+ <div class="stat"><b>{{ stats.total_n }}</b><span>courses terminées au total</span></div>
+ <div class="stat"><b>{{ stats.verse_mois|fcfa }} F</b><span>versements enregistrés ce mois</span></div>
+ <div class="stat"><b>{% if stats.avis_n %}★ {{ stats.note }}/5{% else %}—{% endif %}</b><span>{{ stats.avis_n }} avis client{{ '' if stats.avis_n == 1 else 's' }}</span></div>
+</section>
+<div class="fd-columns"><div>
+ <section class="card"><h2>⏱️ Courses à suivre</h2><div class="fd-list">
+ {% for l in en_cours %}<div class="fd-row"><div class="fd-row-main"><b>{{ l.numero or ('LIV-' ~ '%04d'|format(l.id)) }} · {{ l.client_nom or l.client_tel or 'Client' }}</b><small>{{ l.livraison_quartier or 'Quartier à préciser' }} · {{ l.cree_le or 'Date inconnue' }}</small></div><div class="fd-money"><span class="tag {{ l.statut }}">{{ l.statut }}</span><br><a class="btn sec" style="margin-top:5px;padding:5px 9px;font-size:.75rem" href="{{ url_for('modifier', id=l.id) }}">Ouvrir</a></div></div>
+ {% else %}<p class="vide">Aucune course en cours pour ce livreur.</p>{% endfor %}
+ </div></section>
+ <section class="card"><h2>📦 Activité récente</h2><div class="fd-history"><div class="fd-list">
+ {% for l in livraisons %}<div class="fd-row"><div class="fd-row-main"><b>{{ l.numero or ('LIV-' ~ '%04d'|format(l.id)) }} · {{ l.client_nom or l.client_tel or 'Client' }}</b><small>{{ l.livraison_quartier or 'Quartier à préciser' }} · {{ l.heure_livraison or l.cree_le or 'Date inconnue' }} · paiement client : {{ l.statut_paiement or 'à préciser' }}</small></div><div class="fd-money"><span class="tag {{ l.statut }}">{{ l.statut }}</span><b style="display:block;margin-top:5px">{{ l.prix_course|fcfa }} F</b><a href="{{ url_for('modifier', id=l.id) }}">Détails</a></div></div>
+ {% else %}<p class="vide">Aucune livraison enregistrée sous ce nom.</p>{% endfor %}
+ </div></div></section>
+ </div><aside>
+ <section class="card"><h2>👤 Profil et contact</h2><div class="fd-contact"><div><p><b>Téléphone</b> · {{ livreur.tel or 'À renseigner' }}</p><p><b>Base</b> · {{ livreur.base or 'À renseigner' }}</p><p><b>Disponibilité</b> · {{ 'Disponible pour les nouvelles courses' if livreur.actif else 'En pause' }}</p></div><div class="fd-actions">{% if wa %}<a class="btn sec" target="_blank" rel="noopener" href="https://wa.me/{{ wa }}">💬 WhatsApp</a>{% endif %}{% if tel_lien %}<a class="btn sec" href="tel:{{ tel_lien }}">📞 Appeler</a>{% endif %}</div></div><p><a class="btn sec" href="{{ url_for('livreurs', modifier=livreur.id) }}#livreur-{{ livreur.id }}">Modifier le profil</a></p></section>
+  <section class="card"><h2>🔐 Compte privé du livreur</h2><p class="mut">Le livreur se connectera avec un identifiant et un mot de passe à la page commune ci-dessous. Son compte ne donne accès qu’à ses courses et à son profil.</p>{% if msg %}<p><span class="pastille">{{ msg }}</span></p>{% endif %}<p><b>Identifiant actuel :</b> {{ identifiant_compte or 'Aucun compte configuré' }}</p><form method="post" action="{{ url_for('compte_livreur_admin', id=livreur.id) }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><label>Identifiant de connexion<input name="identifiant" value="{{ identifiant_compte or ('livreur' ~ livreur.id) }}" minlength="3" maxlength="40" pattern="[A-Za-z0-9._-]+" required></label><label>Mot de passe initial ou nouveau (12 à 256 caractères)<input type="password" name="mot_de_passe" minlength="12" maxlength="256" autocomplete="new-password" required></label><label>Confirmer le mot de passe<input type="password" name="confirmation" minlength="12" maxlength="256" autocomplete="new-password" required></label><button>Créer ou réinitialiser le compte</button></form><p class="mut">Après validation, transmets l’identifiant et le mot de passe au livreur par un canal privé. Adresse de connexion :</p><input readonly value="{{ lien_connexion() }}" onclick="this.select()">{% if not url_publique %}<p class="mut">Pour une connexion depuis l’extérieur, configure URL_PUBLIQUE et BOUTIQUE_PUBLIQUE=1.</p>{% endif %}</section>
+ <section class="card"><h2>💸 Derniers versements</h2><div class="fd-list">
+ {% for v in versements %}<div class="fd-row"><div class="fd-row-main"><b>{{ v.paye_le }} · {{ v.moyen }}</b><small>{{ v.note or 'Versement' }}</small></div><div class="fd-money"><b>{{ v.montant|fcfa }} F</b></div></div>
+ {% else %}<p class="vide">Aucun versement enregistré.</p>{% endfor %}
+ </div><p class="fd-note">Ces montants sont les paiements réellement saisis. La fiche ne calcule pas de salaire dû : aucun tarif de rémunération n’est défini.</p><a class="btn" href="{{ url_for('revenus', livreur_id=livreur.id) }}">＋ Saisir un paiement</a></section>
+ </aside></div>
+""")
+
+
+@app.route("/livreurs", methods=["GET", "POST"])
+def livreurs():
+    if request.method == "POST":
+        nom = request.form.get("nom", "").strip()[:100]
+        msg, erreur = "", False
+        if nom:
+            with db() as con:
+                cur = con.execute("INSERT OR IGNORE INTO livreurs(nom, tel, base, actif, token) VALUES (?,?,?,1,?)",
+                                  (nom, chiffres(request.form.get("tel", "")),
+                                   request.form.get("base", "").strip()[:120], secrets.token_urlsafe(24)))
+            if cur.rowcount:
+                msg = f"{nom} a été ajouté à l’équipe."
+            else:
+                msg, erreur = "Ce nom existe déjà dans l’équipe.", True
+        else:
+            msg, erreur = "Indique le nom du livreur.", True
+        return redirect(url_for("livreurs", vue=request.form.get("vue", "tous"),
+                                q=request.form.get("q", "")[:100], msg=msg, erreur=int(erreur)))
+    debut = lundi(date.today()).isoformat()
+    mois = date.today().strftime("%Y-%m")
+    with db() as con:
+        rows = con.execute(
+            "SELECT lv.*, COALESCE(d.en_cours,0) en_cours, COALESCE(d.semaine_n,0) semaine_n, "
+            "COALESCE(d.semaine_r,0) semaine_r, d.derniere, COALESCE(p.verse_mois,0) verse_mois "
+            "FROM livreurs lv LEFT JOIN (SELECT livreur, "
+            "SUM(CASE WHEN statut IN ('en attente','collecté') THEN 1 ELSE 0 END) en_cours, "
+            "SUM(CASE WHEN statut='livré' AND date(COALESCE(NULLIF(heure_livraison,''),cree_le))>=? THEN 1 ELSE 0 END) semaine_n, "
+            "SUM(CASE WHEN statut='livré' AND date(COALESCE(NULLIF(heure_livraison,''),cree_le))>=? THEN prix_course ELSE 0 END) semaine_r, "
+            "MAX(CASE WHEN statut!='annulé' THEN date(cree_le) END) derniere "
+            "FROM livraisons GROUP BY livreur) d ON d.livreur=lv.nom "
+            "LEFT JOIN (SELECT livreur_id, SUM(montant) verse_mois FROM paiements_livreurs "
+            "WHERE substr(paye_le,1,7)=? GROUP BY livreur_id) p ON p.livreur_id=lv.id "
+            "ORDER BY lv.actif DESC, lower(lv.nom)", (debut, debut, mois)).fetchall()
+        avis = {r["livreur"]: r for r in con.execute(
+            "SELECT livreur, ROUND(AVG(note),1) note, COUNT(*) nb FROM avis "
+            "WHERE COALESCE(livreur,'')!='' GROUP BY livreur").fetchall()}
+
+    liste = []
+    for row in rows:
+        l = dict(row)
+        l["wa"] = tel_wa(l["tel"])
+        note = avis.get(l["nom"])
+        l["note"] = note["note"] if note and note["nb"] >= 3 else None
+        l["nb_avis"] = note["nb"] if note else 0
+        l["manque"] = (["numéro WhatsApp"] if not l["tel"] else []) + (["base de départ"] if not l["base"] else [])
+        liste.append(l)
+
+    q = request.args.get("q", "").strip()
+    vue = request.args.get("vue", "tous")
+    if vue not in {"tous", "actifs", "pause", "charges"}:
+        vue = "tous"
+    resume = {
+        "total": len(liste), "actifs": sum(bool(l["actif"]) for l in liste),
+        "pauses": sum(not l["actif"] for l in liste), "en_cours": sum(l["en_cours"] for l in liste),
+        "charges": sum(l["en_cours"] >= 2 for l in liste),
+        "semaine_n": sum(l["semaine_n"] for l in liste),
+        "versements": sum(l["verse_mois"] for l in liste),
+    }
+    filtres = [
+        {"id": "tous", "nom": "Toute l’équipe", "icone": "👥", "n": resume["total"]},
+        {"id": "actifs", "nom": "Disponibles", "icone": "🟢", "n": resume["actifs"]},
+        {"id": "charges", "nom": "Très sollicités · 2+", "icone": "⏱️", "n": resume["charges"]},
+        {"id": "pause", "nom": "En pause", "icone": "🌙", "n": resume["pauses"]},
+    ]
+    if vue == "actifs":
+        liste = [l for l in liste if l["actif"]]
+    elif vue == "pause":
+        liste = [l for l in liste if not l["actif"]]
+    elif vue == "charges":
+        liste = [l for l in liste if l["en_cours"] >= 2]
+        liste.sort(key=lambda l: (-l["en_cours"], not l["actif"], l["nom"].lower()))
+    if q:
+        needle = q.lower()
+        qd = chiffres(q)
+        liste = [l for l in liste if needle in l["nom"].lower() or needle in (l["base"] or "").lower()
+                 or (qd and qd in chiffres(l["tel"]))]
+    if vue != "charges":
+        liste.sort(key=lambda l: (-int(bool(l["actif"])), l["en_cours"], l["nom"].lower()))
+    return render_template_string(PAGE_LIVREURS, liste=liste, resume=resume, filtres=filtres,
+                                  vue=vue, q=q, total=len(liste), modifier_id=request.args.get("modifier", type=int) or 0,
+                                  a_configurer=[l for l in liste if l["manque"]][:8],
+                                  msg=request.args.get("msg", "")[:200], erreur=request.args.get("erreur", "") == "1")
+
+
+@app.route("/livreurs/<int:id>", methods=["POST"])
+def modifier_livreur(id):
+    nom = request.form.get("nom", "").strip()[:100]
+    msg, erreur = "Profil du livreur mis à jour.", False
+    try:
+        with db() as con:
+            ancien = con.execute("SELECT nom FROM livreurs WHERE id=?", (id,)).fetchone()
+            if ancien and nom:
+                con.execute("UPDATE livreurs SET nom=?, tel=?, base=?, actif=? WHERE id=?",
+                            (nom, chiffres(request.form.get("tel", "")), request.form.get("base", "").strip()[:120],
+                             1 if request.form.get("actif") else 0, id))
+                if nom != ancien["nom"]:  # on garde l'historique sous le nouveau nom
+                    con.execute("UPDATE livraisons SET livreur=? WHERE livreur=?", (nom, ancien["nom"]))
+                    con.execute("UPDATE avis SET livreur=? WHERE livreur=?", (nom, ancien["nom"]))
+            else:
+                msg, erreur = "Livreur introuvable ou nom manquant.", True
+    except sqlite3.IntegrityError:
+        msg, erreur = "Un autre livreur porte déjà ce nom.", True
+    return redirect(url_for("livreurs", vue=request.form.get("vue", "tous"), q=request.form.get("q", "")[:100],
+                            msg=msg, erreur=int(erreur)))
+
+
+@app.route("/livreurs/<int:id>/supprimer", methods=["POST"])
+def supprimer_livreur(id):
+    with db() as con:
+        # Conserver l'historique des courses et des versements : on retire seulement le livreur des affectations.
+        cur = con.execute("UPDATE livreurs SET actif=0 WHERE id=?", (id,))
+    msg = "Livreur mis en pause. Son historique et ses paiements sont conservés." if cur.rowcount else "Livreur introuvable."
+    return redirect(url_for("livreurs", vue=request.form.get("vue", "tous"), q=request.form.get("q", "")[:100],
+                            msg=msg, erreur=0 if cur.rowcount else 1))
+
+
+@app.route("/livreurs/<int:id>/fiche")
+def fiche_livreur(id):
+    debut = lundi(date.today()).isoformat()
+    mois = date.today().strftime("%Y-%m")
+    with db() as con:
+        livreur = con.execute("SELECT * FROM livreurs WHERE id=?", (id,)).fetchone()
+        if not livreur:
+            return redirect(url_for("livreurs", msg="Ce livreur n’existe plus.", erreur=1))
+        nom = livreur["nom"]
+        stats = con.execute(
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN statut IN ('en attente','collecté') THEN 1 ELSE 0 END),0) en_cours, "
+            "COALESCE(SUM(CASE WHEN statut='livré' AND date(COALESCE(NULLIF(heure_livraison,''),cree_le))>=? THEN 1 ELSE 0 END),0) semaine_n, "
+            "COALESCE(SUM(CASE WHEN statut='livré' AND date(COALESCE(NULLIF(heure_livraison,''),cree_le))>=? THEN prix_course ELSE 0 END),0) semaine_brut, "
+            "COALESCE(SUM(CASE WHEN statut='livré' AND substr(date(COALESCE(NULLIF(heure_livraison,''),cree_le)),1,7)=? THEN 1 ELSE 0 END),0) mois_n, "
+            "COALESCE(SUM(CASE WHEN statut='livré' AND substr(date(COALESCE(NULLIF(heure_livraison,''),cree_le)),1,7)=? THEN prix_course ELSE 0 END),0) mois_brut, "
+            "COALESCE(SUM(CASE WHEN statut='livré' THEN 1 ELSE 0 END),0) total_n "
+            "FROM livraisons WHERE livreur=?", (debut, debut, mois, mois, nom)).fetchone()
+        verse_mois = con.execute("SELECT COALESCE(SUM(montant),0) FROM paiements_livreurs "
+                                 "WHERE livreur_id=? AND substr(paye_le,1,7)=?", (id, mois)).fetchone()[0]
+        avis = con.execute("SELECT ROUND(AVG(note),1) note, COUNT(*) n FROM avis "
+                            "WHERE livreur=?", (nom,)).fetchone()
+        en_cours = con.execute("SELECT id, numero, client_nom, client_tel, livraison_quartier, prix_course, statut, cree_le "
+                               "FROM livraisons WHERE livreur=? AND statut IN ('en attente','collecté') "
+                               "ORDER BY id", (nom,)).fetchall()
+        livraisons = con.execute("SELECT id, numero, client_nom, client_tel, livraison_quartier, prix_course, statut, "
+                                 "statut_paiement, cree_le, heure_livraison FROM livraisons WHERE livreur=? "
+                                 "ORDER BY id DESC LIMIT 20", (nom,)).fetchall()
+        versements = con.execute("SELECT montant, moyen, note, paye_le FROM paiements_livreurs "
+                                 "WHERE livreur_id=? ORDER BY paye_le DESC, id DESC LIMIT 15", (id,)).fetchall()
+    data_stats = dict(stats)
+    data_stats.update(verse_mois=verse_mois, note=avis["note"] or 0, avis_n=avis["n"] or 0)
+    return render_template_string(PAGE_FICHE_LIVREUR, livreur=dict(livreur), stats=data_stats,
+                                  en_cours=en_cours, livraisons=livraisons, versements=versements,
+                                  wa=tel_wa(livreur["tel"]), tel_lien=chiffres(livreur["tel"] or ""),
+                                  msg=request.args.get("msg", "")[:200], url_publique=bool(os.environ.get("URL_PUBLIQUE")),
+                                  identifiant_compte=identifiant_compte_portail("livreur", id))
+
+
+@app.route("/livreurs/<int:id>/portail/nouveau", methods=["POST"])
+def renouveler_portail_livreur(id):
+    with db() as con:
+        cur = con.execute("UPDATE livreurs SET token=? WHERE id=?", (secrets.token_urlsafe(24), id))
+    if not cur.rowcount:
+        return redirect(url_for("livreurs", msg="Livreur introuvable.", erreur=1))
+    return redirect(url_for("fiche_livreur", id=id, msg="Ancien lien révoqué. Le nouveau lien est affiché ci-dessous."))
+
+
+def enregistrer_compte_portail_admin(role, profil_id):
+    identifiant = request.form.get("identifiant", "").strip().lower()
+    mot_de_passe = request.form.get("mot_de_passe", "")
+    confirmation = request.form.get("confirmation", "")
+    if not re.fullmatch(r"[a-z0-9._-]{3,40}", identifiant):
+        return "L’identifiant doit contenir 3 à 40 caractères : lettres, chiffres, point, tiret ou souligné."
+    if len(mot_de_passe) < 12 or len(mot_de_passe) > 256:
+        return "Choisis un mot de passe de 12 à 256 caractères."
+    if mot_de_passe != confirmation:
+        return "Les deux mots de passe ne correspondent pas."
+    table = "livreurs" if role == "livreur" else "partenaires"
+    with db() as con:
+        if not con.execute(f"SELECT 1 FROM {table} WHERE id=?", (profil_id,)).fetchone():
+            return "Profil introuvable."
+        existant = con.execute("SELECT id FROM comptes_portail WHERE role=? AND profil_id=?",
+                               (role, profil_id)).fetchone()
+        try:
+            if existant:
+                con.execute("UPDATE comptes_portail SET identifiant=?, mot_de_passe_hash=?, version_session=version_session+1, modifie_le=? WHERE id=?",
+                            (identifiant, generate_password_hash(mot_de_passe), maintenant(), existant["id"]))
+            else:
+                con.execute("INSERT INTO comptes_portail(role, profil_id, identifiant, mot_de_passe_hash, cree_le, modifie_le) "
+                            "VALUES (?,?,?,?,?,?)",
+                            (role, profil_id, identifiant, generate_password_hash(mot_de_passe), maintenant(), maintenant()))
+        except sqlite3.IntegrityError:
+            return "Cet identifiant est déjà utilisé par un autre compte."
+    return "Compte enregistré. Transmets l’identifiant et le mot de passe à la personne par un canal privé."
+
+
+@app.route("/livreurs/<int:id>/compte", methods=["POST"])
+def compte_livreur_admin(id):
+    msg = enregistrer_compte_portail_admin("livreur", id)
+    return redirect(url_for("fiche_livreur", id=id, msg=msg))
+
+
+# ===================== V10 : WhatsApp automatique (API officielle Cloud) =====================
+import base64
+import hashlib
+import hmac
+import ipaddress
+import unicodedata
+import urllib.error
+import uuid
+
+WA_VERSION = os.environ.get("WA_API_VERSION", "v23.0")
+_ctx = threading.local()  # _ctx.sim = True : simulation, aucun message réellement envoyé
+
+# Textes envoyés aux clients. Modifie-les librement. {nom} {numero} {livreur} {paiement} {entreprise} {manque}
+MESSAGES_CLIENT = {
+    "recu": "Bonjour{nom}, votre commande {numero} est bien reçue ✅ Votre livreur : {livreur}. Il se rend au lieu de collecte. - {entreprise}",
+    "question": "Bonjour{nom}, pour votre commande {numero} il me manque : {manque}. Pouvez-vous le préciser ? - {entreprise}",
+    "collecte": "Bonjour{nom}, votre colis a été récupéré par {livreur} 🏍️ Il arrive bientôt. - {entreprise}",
+    "livre": "Bonjour{nom}, votre colis a été livré ✅ Merci de votre confiance ! {paiement}- {entreprise}",
+}
+ETATS_WA = {"a_verifier": "À vérifier", "erreur_envoi": "Envoi échoué", "a_completer": "En attente de précisions du client"}
+
+
+def migrer_wa(con):
+    existantes = {r[1] for r in con.execute("PRAGMA table_info(livraisons)")}
+    for col in ("auto_etat", "auto_note"):
+        if col not in existantes:
+            con.execute(f"ALTER TABLE livraisons ADD COLUMN {col} TEXT DEFAULT ''")
+
+
+def wa_configure():
+    return bool(os.environ.get("WA_TOKEN") and os.environ.get("WA_PHONE_ID"))
+
+
+def msg_erreur(d):
+    return d if isinstance(d, str) else str(d.get("message") or d)
+
+
+def journaliser_wa(msg_id, sens, tel, type_, contenu, livraison_id=None, statut=""):
+    with db() as con:
+        con.execute("INSERT OR IGNORE INTO messages_wa(id, sens, tel, type, contenu, cree_le, livraison_id, statut) "
+                    "VALUES (?,?,?,?,?,?,?,?)", (msg_id or f"{sens}-{uuid.uuid4().hex[:12]}", sens, tel, type_,
+                                                 (contenu or "")[:2000], maintenant(), livraison_id, statut))
+
+
+def marquer(id, etat, note=""):
+    with db() as con:
+        con.execute("UPDATE livraisons SET auto_etat=?, auto_note=? WHERE id=?", (etat, note[:300], id))
+
+
+def a_traiter(limite=None, con=None):
+    sql = ("SELECT * FROM livraisons WHERE auto_etat IN ('a_verifier','erreur_envoi','a_completer') "
+           "ORDER BY id DESC")
+    params = []
+    if limite is not None:
+        try:
+            limite = max(1, min(100, int(limite)))
+        except (TypeError, ValueError):
+            limite = 10
+        sql += " LIMIT ?"
+        params.append(limite)
+    if con is not None:
+        return con.execute(sql, params).fetchall()
+    with db() as connexion:
+        return connexion.execute(sql, params).fetchall()
+
+
+app.jinja_env.globals.update(a_traiter=a_traiter, etat_wa=lambda e: ETATS_WA.get(e, e))
+
+
+def api_wa(corps):
+    url = f"https://graph.facebook.com/{WA_VERSION}/{os.environ['WA_PHONE_ID']}/messages"
+    try:
+        return True, _http_json(url, {"messaging_product": "whatsapp", **corps},
+                                {"Authorization": "Bearer " + os.environ["WA_TOKEN"]})
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8")).get("error", {})
+        except Exception:
+            err = {}
+        return False, err or {"message": f"HTTP {e.code}"}
+    except Exception as e:
+        return False, {"message": type(e).__name__}
+
+
+def envoyer(tel, texte, boutons=None, modele=None, type_="msg", livraison_id=None):
+    """Envoie un message WhatsApp. boutons = [(id, titre)], 3 maximum.
+    modele = (variable d'environnement du nom de modèle, [variables du corps], [payloads des boutons]) :
+    utilisé si le message libre est refusé parce que la fenêtre de 24 h est fermée. Retourne (ok, détail)."""
+    n = tel_wa(tel)
+    if not n:
+        return False, "numéro manquant"
+    if getattr(_ctx, "sim", False):
+        suite = " [" + " | ".join(t for _, t in boutons) + "]" if boutons else ""
+        journaliser_wa(None, "out", n, type_, texte + suite, livraison_id, "simulé")
+        return True, "simulé"
+    if not wa_configure():
+        return False, "WhatsApp non configuré"
+    if boutons:
+        corps = {"to": n, "type": "interactive", "interactive": {
+            "type": "button", "body": {"text": texte[:1000]},
+            "action": {"buttons": [{"type": "reply", "reply": {"id": i, "title": t[:20]}} for i, t in boutons[:3]]}}}
+    else:
+        corps = {"to": n, "type": "text", "text": {"body": texte[:4000]}}
+    ok, r = api_wa(corps)
+    if not ok and r.get("code") == 131047 and modele and os.environ.get(modele[0]):  # fenêtre de 24 h fermée
+        comp = [{"type": "body", "parameters": [{"type": "text", "text": " ".join(str(v).split())[:900]} for v in modele[1]]}]
+        comp += [{"type": "button", "sub_type": "quick_reply", "index": str(k),
+                  "parameters": [{"type": "payload", "payload": p}]} for k, p in enumerate(modele[2])]
+        ok, r = api_wa({"to": n, "type": "template", "template": {
+            "name": os.environ[modele[0]], "language": {"code": os.environ.get("WA_TEMPLATE_LANG", "fr")}, "components": comp}})
+    wid = ((r.get("messages") or [{}])[0].get("id") if ok else None)
+    journaliser_wa(wid, "out", n, type_, texte, livraison_id, "envoyé" if ok else f"échec : {msg_erreur(r)}"[:200])
+    return ok, r
+
+
+def texte_client(cle, l, **extra):
+    nom = f" {l['client_nom']}" if l["client_nom"] else ""
+    paiement = ""
+    if l["statut_paiement"] != "payé" and l["prix_course"]:
+        paiement = f"Montant de la course : {fcfa(l['prix_course'])} F ({l['mode_paiement'] or 'à régler'}). "
+    return MESSAGES_CLIENT[cle].format(nom=nom, numero=l["numero"], livreur=l["livreur"] or "notre équipe",
+                                       paiement=paiement, entreprise=nom_entreprise(), manque="", **extra)
+
+
+def notifier_client(id, quoi):
+    """Prévient le client (une seule fois par étape) : quoi = 'collecte' ou 'livre'."""
+    if not (wa_configure() or getattr(_ctx, "sim", False)):
+        return
+    type_ = "notif_" + quoi
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+        deja = con.execute("SELECT 1 FROM messages_wa WHERE livraison_id=? AND type=? AND sens='out' "
+                           "AND statut NOT LIKE 'échec%'", (id, type_)).fetchone()
+    if not l or deja or l["canal"] != "WhatsApp" or not l["client_tel"]:
+        return
+    texte = texte_client(quoi, l)
+    ok, d = envoyer(l["client_tel"], texte, modele=("WA_TEMPLATE_CLIENT", [texte], []), type_=type_, livraison_id=id)
+    if not ok:
+        marquer(id, "a_verifier", f"Client non prévenu ({msg_erreur(d)})")
+
+
+REQUETES_STATUT = {
+    "collecte": "UPDATE livraisons SET statut='collecté', heure_collecte=? WHERE id=?",
+    "livre": "UPDATE livraisons SET statut='livré', heure_livraison=? WHERE id=?",
+    "paye": "UPDATE livraisons SET statut_paiement='payé', heure_paiement=? WHERE id=?",
+}
+
+
+def changer_statut(id, quoi, recu_par=""):
+    with db() as con:
+        if quoi == "paye" and recu_par == "livreur":
+            con.execute("UPDATE livraisons SET statut_paiement='payé', heure_paiement=?, "
+                        "paiement_recu_par=CASE WHEN CAST(ROUND(COALESCE(prix_course,0)) AS INTEGER)>0 "
+                        "THEN 'livreur' ELSE '' END, "
+                        "montant_encaisse_livreur=CAST(ROUND(COALESCE(prix_course,0)) AS INTEGER) "
+                        "WHERE id=? AND statut_paiement!='payé'", (maintenant(), id))
+        else:
+            con.execute(REQUETES_STATUT[quoi], (maintenant(), id))
+    if quoi in ("collecte", "livre"):
+        notifier_client(id, quoi)
+
+
+# ---------- analyse d'un message de client et envoi au livreur ----------
+OPTIONS_CHAMPS = {c[0]: c[3] for c in CHAMPS if c[3]}
+
+
+def valeurs_extraites(d):
+    out = {}
+    for k in CLES:
+        v = d.get(k, "")
+        if k in NOMBRES:
+            n = nombre(v) if v not in ("", None) else None
+            v = n if n is not None else (None if k == "distance_km" else 0)
+        else:
+            v = str(v or "").strip()
+        if k in OPTIONS_CHAMPS and v and v not in OPTIONS_CHAMPS[k]:
+            v = ""
+        out[k] = v
+    return out
+
+
+def creer_livraison(v, tel, nom, texte):
+    v = dict(v, canal="WhatsApp", client_tel=tel, client_nom=v["client_nom"] or nom, statut="en attente")
+    if v.get("encaisse_course_prevu") not in ("À préciser", "Livreur", "Notre équipe"):
+        v["encaisse_course_prevu"] = "À préciser"
+    v["statut_paiement"] = v["statut_paiement"] if v["statut_paiement"] in ("payé", "crédit") else "en attente"
+    colonnes = CLES + ["message_original", "cree_le", "auto_etat", "auto_note"]
+    valeurs = [v[c] for c in CLES] + [texte, maintenant(), "", ""]
+    with db() as con:
+        cur = con.execute(f"INSERT INTO livraisons ({','.join(colonnes)}) VALUES ({','.join('?' * len(colonnes))})", valeurs)
+        con.execute("UPDATE livraisons SET numero=? WHERE id=?", (f"LIV-{cur.lastrowid:04d}", cur.lastrowid))
+    return cur.lastrowid
+
+
+def manquants(l):
+    m = []
+    if not (l["collecte_lieu"] or l["collecte_quartier"]):
+        m.append("le lieu de collecte")
+    if not (l["livraison_adresse"] or l["livraison_quartier"]):
+        m.append("l'adresse ou le quartier de livraison")
+    return m
+
+
+def envoyer_commande_livreur(l):
+    with db() as con:
+        lv = con.execute("SELECT * FROM livreurs WHERE nom=?", (l["livreur"],)).fetchone()
+    if not lv or not lv["tel"]:
+        return False, "numéro WhatsApp du livreur manquant"
+    texte = texte_commande(l)
+    boutons = [(f"collecte:{l['id']}", "✅ Récupéré"), (f"livre:{l['id']}", "🏁 Livré"), (f"probleme:{l['id']}", "⚠️ Problème")]
+    return envoyer(lv["tel"], texte, boutons, ("WA_TEMPLATE_LIVREUR", [l["numero"], texte], [b[0] for b in boutons]),
+                   "dispatch", l["id"])
+
+
+def dispatcher(id):
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+    collecte = ", ".join(x for x in (l["collecte_lieu"], l["collecte_quartier"]) if x)
+    arrivee = ", ".join(x for x in (l["livraison_adresse"], l["livraison_quartier"]) if x)
+    try:
+        liste, _ = classer_livreurs(collecte, l["collecte_quartier"] or "")
+    except Exception as e:
+        marquer(id, "a_verifier", f"Livreur à choisir à la main ({msg_erreur(str(e))})")
+        return
+    try:  # distance estimée (facultative)
+        p = geocoder(collecte) or geocoder(l["collecte_quartier"] or "")
+        q = geocoder(arrivee) or geocoder(l["livraison_quartier"] or "")
+        if p and q and not l["distance_km"]:
+            with db() as con:
+                con.execute("UPDATE livraisons SET distance_km=? WHERE id=?", (round(vol_oiseau_km(p, q) * 1.3, 1), id))
+    except Exception:
+        pass
+    with db() as con:
+        con.execute("UPDATE livraisons SET livreur=? WHERE id=?", (liste[0]["nom"], id))
+        l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+    ok, d = envoyer_commande_livreur(l)
+    if not ok:
+        marquer(id, "erreur_envoi", f"Commande non transmise à {l['livreur']} ({msg_erreur(d)})")
+        alerter_equipe(f"⚠️ {l['numero']} : commande non transmise à {l['livreur']} ({msg_erreur(d)})", id)
+        return
+    marquer(id, "", "")
+    texte = texte_client("recu", l)
+    envoyer(l["client_tel"], texte, modele=("WA_TEMPLATE_CLIENT", [texte], []), type_="recu", livraison_id=id)
+
+
+def traiter_client(tel, nom, texte):
+    limite = (datetime.now() - timedelta(hours=12)).strftime("%Y-%m-%d %H:%M")
+    with db() as con:
+        ouvert = con.execute("SELECT * FROM livraisons WHERE auto_etat='a_completer' AND client_tel=? AND cree_le>=? "
+                             "ORDER BY id DESC LIMIT 1", (tel, limite)).fetchone()
+    complet = (ouvert["message_original"] + "\n" + texte) if ouvert else texte
+    try:
+        v = completer_depuis_historique(valeurs_extraites(extraire_avec_ia(complet)), tel, complet)
+    except Exception as e:
+        if ouvert:
+            with db() as con:
+                con.execute("UPDATE livraisons SET message_original=? WHERE id=?", (complet, ouvert["id"]))
+            id = ouvert["id"]
+        else:
+            id = creer_livraison({k: ("" if k not in NOMBRES else 0) for k in CLES}, tel, nom, texte)
+        marquer(id, "a_verifier", f"Analyse automatique impossible ({e}) : lire le message")
+        return
+    if ouvert:
+        id = ouvert["id"]
+        champs = {k: v[k] for k in CLES if v[k] not in ("", None, 0)
+                  and k not in ("statut", "statut_paiement", "canal", "client_tel", "livreur")
+                  and not (k == "encaisse_course_prevu" and v[k] == "À préciser")}
+        champs["message_original"] = complet
+        with db() as con:
+            con.execute(f"UPDATE livraisons SET {','.join(c + '=?' for c in champs)} WHERE id=?", [*champs.values(), id])
+    else:
+        id = creer_livraison(v, tel, nom, texte)
+    lier_catalogue(id)  # reconnaît le partenaire et les articles du catalogue cités par le client
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+    m = manquants(l)
+    if m:
+        marquer(id, "a_completer", "Il manque : " + ", ".join(m))
+        q = MESSAGES_CLIENT["question"].format(nom=f" {l['client_nom']}" if l["client_nom"] else "", numero=l["numero"],
+                                               manque=" et ".join(m), entreprise=nom_entreprise())
+        envoyer(tel, q, modele=("WA_TEMPLATE_CLIENT", [q], []), type_="question", livraison_id=id)
+        return
+    accuser_reception(id)  # le client sait tout de suite que sa commande est enregistrée
+    if os.environ.get("WA_MODE", "auto").lower() == "manuel":
+        marquer(id, "a_verifier", "Mode manuel : choisir le livreur et envoyer la commande")
+        return
+    dispatcher(id)
+
+
+# ---------- réponses des livreurs ----------
+def normaliser(t):
+    return "".join(c for c in unicodedata.normalize("NFD", (t or "").lower()) if unicodedata.category(c) != "Mn")
+
+
+MOTS = [("probleme", r"\b(probleme|souci|injoignable|annule|bloque|panne|accident|introuvable)\b"),
+        ("livre", r"\b(livre|livree|termine|fini|remis|donne)\b"),
+        ("collecte", r"\b(recupere|recuperee|recup|pris|collecte|ramasse)\b"),
+        ("paye", r"\b(paye|encaisse|regle)\b")]
+
+
+def intention(t):
+    n = normaliser(t)
+    return next((nom for nom, motif in MOTS if re.search(motif, n)), "")
+
+
+def traiter_livreur(lv, msg, texte):
+    tel = lv["tel"]
+    action, id_liv = "", None
+    if msg["bouton"]:
+        action, _, i = msg["bouton"].partition(":")
+        id_liv = int(i) if i.isdigit() else None
+    else:
+        action = intention(texte)
+        m = re.search(r"LIV-?(\d+)", texte or "", re.I)
+        id_liv = int(m.group(1)) if m else None
+    if action not in REQUETES_STATUT and action != "probleme":
+        envoyer(tel, "Je n'ai pas compris. Utilise les boutons ✅ Récupéré / 🏁 Livré / ⚠️ Problème, ou écris par exemple : « LIV-0005 récupéré ».", type_="aide")
+        return
+    with db() as con:
+        if id_liv:
+            cand = con.execute("SELECT * FROM livraisons WHERE id=? AND livreur=?", (id_liv, lv["nom"])).fetchall()
+        else:
+            ordre = {"collecte": ("en attente",), "livre": ("collecté", "en attente"), "paye": ("livré",),
+                     "probleme": ("en attente", "collecté", "livré")}[action]
+            cand = [r for r in con.execute("SELECT * FROM livraisons WHERE livreur=? ORDER BY id", (lv["nom"],)).fetchall()
+                    if r["statut"] in ordre and not (action == "paye" and r["statut_paiement"] == "payé")]
+    if not cand:
+        envoyer(tel, "Aucune course en cours correspondante.", type_="aide")
+        return
+    if len(cand) > 1:
+        envoyer(tel, "Quelle commande ? Réponds par exemple « " + cand[0]["numero"] + " récupéré ». En cours : "
+                + ", ".join(r["numero"] for r in cand), type_="aide")
+        return
+    l = cand[0]
+    i = l["id"]
+    if action == "probleme":
+        note = f"Problème signalé par {lv['nom']} : {texte or 'voir le livreur'}"
+        with db() as con:
+            con.execute("UPDATE livraisons SET remarques=? WHERE id=?",
+                        ((l["remarques"] + " | " if l["remarques"] else "") + f"[{lv['nom']}] {texte or 'problème'}", i))
+        marquer(i, "a_verifier", note)
+        envoyer(tel, f"⚠️ {l['numero']} signalée à l'équipe, on te recontacte.", type_="aide", livraison_id=i)
+        sec = os.environ.get("WA_SECRETAIRE")
+        if sec:
+            envoyer(sec, f"⚠️ {l['numero']} : {note}", type_="alerte", livraison_id=i)
+        return
+    deja = ((action == "collecte" and l["statut"] != "en attente") or (action == "livre" and l["statut"] == "livré")
+            or (action == "paye" and l["statut_paiement"] == "payé"))
+    if deja:
+        envoyer(tel, f"👍 {l['numero']} : déjà enregistré.", type_="aide", livraison_id=i)
+        return
+    changer_statut(i, action, recu_par="livreur" if action == "paye" else "")
+    if action == "collecte":
+        envoyer(tel, f"✅ {l['numero']} récupérée. Le client est prévenu.",
+                [(f"livre:{i}", "🏁 Livré"), (f"probleme:{i}", "⚠️ Problème")], type_="aide", livraison_id=i)
+    elif action == "livre":
+        du = l["statut_paiement"] != "payé" and l["prix_course"]
+        collecteur = l["encaisse_course_prevu"] or "À préciser"
+        if du and collecteur == "Notre équipe":
+            instruction = " 💵 Le client doit régler la course à l'équipe. Ne confirme le paiement ici que si tu as réellement reçu l'argent."
+        elif du and collecteur == "À préciser":
+            instruction = " 💵 Le collecteur n'est pas défini : vérifie auprès du responsable. Confirme seulement si tu as reçu l'argent."
+        else:
+            instruction = f" 💰 Course à encaisser : {fcfa(l['prix_course'])} F." if du else ""
+        envoyer(tel, f"🏁 Merci ! {l['numero']} livrée. Le client est prévenu." + instruction,
+                [(f"paye:{i}", "💰 Argent reçu")] if du else None, type_="aide", livraison_id=i)
+    else:
+        envoyer(tel, f"💰 {l['numero']} : paiement noté.", type_="aide", livraison_id=i)
+
+
+# ---------- réception (webhook) ----------
+def extraire_messages(payload):
+    sortie = []
+    for entree in payload.get("entry", []):
+        for ch in entree.get("changes", []):
+            v = ch.get("value", {})
+            noms = {c.get("wa_id"): (c.get("profile") or {}).get("name", "") for c in v.get("contacts", [])}
+            for m in v.get("messages", []):
+                t = m.get("type")
+                msg = {"id": m.get("id"), "from": m.get("from", ""), "type": t, "texte": "", "bouton": "", "media": "",
+                       "nom": noms.get(m.get("from"), "")}
+                if t == "text":
+                    msg["texte"] = (m.get("text") or {}).get("body", "")
+                elif t == "interactive":
+                    r = (m.get("interactive") or {}).get("button_reply") or (m.get("interactive") or {}).get("list_reply") or {}
+                    msg["bouton"], msg["texte"] = r.get("id", ""), r.get("title", "")
+                elif t == "button":
+                    msg["bouton"], msg["texte"] = (m.get("button") or {}).get("payload", ""), (m.get("button") or {}).get("text", "")
+                elif t == "audio":
+                    msg["media"] = (m.get("audio") or {}).get("id", "")
+                sortie.append(msg)
+    return sortie
+
+
+def _telecharger(url):
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["WA_TOKEN"], "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def transcrire_audio(media_id):
+    info = _http_json(f"https://graph.facebook.com/{WA_VERSION}/{media_id}", None,
+                      {"Authorization": "Bearer " + os.environ["WA_TOKEN"]})
+    donnees = _telecharger(info["url"])
+    rep, _ = appel_gemini(
+        {"contents": [{"parts": [
+            {"text": "Transcris mot pour mot ce message vocal (français, mooré ou dioula possibles). Réponds uniquement par la transcription."},
+            {"inline_data": {"mime_type": (info.get("mime_type") or "audio/ogg").split(";")[0],
+                             "data": base64.b64encode(donnees).decode()}}]}]}, 90)
+    return rep["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+def traiter_message(msg):
+    tel = chiffres(msg["from"])
+    with db() as con:  # Meta peut renvoyer le même message : on ne le traite qu'une fois
+        if msg["id"] and con.execute("SELECT 1 FROM messages_wa WHERE id=?", (msg["id"],)).fetchone():
+            return
+    texte, echec = msg["texte"], ""
+    if msg["type"] == "audio" and msg["media"]:
+        try:
+            texte = transcrire_audio(msg["media"])
+        except Exception as e:
+            echec = f"Message vocal non transcrit ({type(e).__name__})"
+    journaliser_wa(msg["id"], "in", tel, msg["type"], texte or echec or f"[{msg['type']}]")
+    with db() as con:
+        lv = con.execute("SELECT * FROM livreurs WHERE tel=? AND tel!=''", (tel,)).fetchone()
+    if lv:
+        return traiter_livreur(lv, msg, texte)
+    if echec:  # vocal illisible : un humain doit l'écouter
+        id = creer_livraison({k: ("" if k not in NOMBRES else 0) for k in CLES}, tel, msg["nom"], "[message vocal]")
+        marquer(id, "a_verifier", echec + " : écouter le message sur WhatsApp")
+        return
+    if texte.strip():
+        traiter_client(tel, msg["nom"], texte)
+
+
+def traiter_webhook(payload):
+    try:
+        for e in payload.get("entry", []):
+            for ch in e.get("changes", []):
+                for s in ch.get("value", {}).get("statuses", []):
+                    if s.get("status") == "failed":
+                        journaliser_wa(f"st-{s.get('id')}", "in", s.get("recipient_id", ""), "echec",
+                                       json.dumps(s.get("errors", ""))[:300], None, "échec")
+        for msg in extraire_messages(payload):
+            try:
+                traiter_message(msg)
+            except Exception as e:
+                log.exception("Message WhatsApp non traité")
+                journaliser_wa(None, "in", msg.get("from", ""), "erreur", f"{type(e).__name__}: {e}", None, "erreur")
+    except Exception:
+        log.exception("Webhook illisible")
+
+
+@app.before_request
+def bloquer_acces_public():
+    """Les espaces à comptes sont isolés; l'administration exige un mot de passe hors de ce PC."""
+    via_proxy = request.headers.get("X-Forwarded-For") or request.headers.get("CF-Connecting-IP")
+    mdp_admin = os.environ.get("APP_MOT_DE_PASSE", "")
+    portail = chemin_portail(request.path)
+    webhook_public = request.path == "/webhook"
+    boutique_ouverte = os.environ.get("BOUTIQUE_PUBLIQUE", "") == "1"
+    if via_proxy and portail and not boutique_ouverte:
+        return "Accès externe désactivé pour les espaces privés. Configure BOUTIQUE_PUBLIQUE=1 pour les partager.", 403
+    if via_proxy and not webhook_public and not portail and not mdp_admin:
+        return "Accès refusé : l’administration est limitée à ce PC tant qu’aucun mot de passe n’est configuré.", 403
+    if not via_proxy and not mdp_admin and not (portail or webhook_public):
+        try:
+            ip_client = ipaddress.ip_address(request.remote_addr or "")
+            depuis_ce_pc = ip_client.is_loopback or bool(getattr(ip_client, "ipv4_mapped", None)
+                                                          and ip_client.ipv4_mapped.is_loopback)
+        except ValueError:
+            depuis_ce_pc = False
+        if not depuis_ce_pc:
+            return "Accès refusé : l’administration est limitée à ce PC. Configure APP_MOT_DE_PASSE pour l’utiliser sur le réseau.", 403
+
+
+def csrf_portail():
+    jeton = session.get("_csrf_portail")
+    if not jeton:
+        jeton = secrets.token_urlsafe(32)
+        session["_csrf_portail"] = jeton
+    return jeton
+
+
+@app.before_request
+def verifier_csrf_portail():
+    portail = (request.path in {"/connexion", "/deconnexion", "/compte/profil"}
+               or request.path.startswith(("/espace", "/portail-livreur")))
+    administration_compte = request.path.startswith(("/livreurs/", "/partenaires/")) and request.path.endswith("/compte")
+    if request.method == "POST" and (portail or administration_compte):
+        attendu = session.get("_csrf_portail", "")
+        recu = request.form.get("_csrf", "")
+        if not attendu or not hmac.compare_digest(attendu, recu):
+            return "Formulaire expiré. Recharge la page puis réessaie.", 400
+
+
+@app.before_request
+def verifier_origine_admin():
+    """Refuse les requêtes de modification lancées depuis un autre site dans le navigateur."""
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"} or chemin_public(request.path):
+        return None
+
+    source = request.headers.get("Origin", "").strip()
+    if not source:
+        source = request.headers.get("Referer", "").strip()
+    if not source:
+        return "Origine absente : recharge la page depuis l’application puis réessaie.", 403
+
+    try:
+        origine = urlsplit(source)
+    except ValueError:
+        return "Origine invalide.", 403
+    if not origine.scheme or not origine.netloc:
+        return "Origine invalide.", 403
+
+    via_proxy = request.headers.get("X-Forwarded-For") or request.headers.get("CF-Connecting-IP")
+    proto_proxy = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+    schema_attendu = proto_proxy if via_proxy and proto_proxy in {"http", "https"} else request.scheme.lower()
+    if origine.netloc.lower() != request.host.lower() or origine.scheme.lower() != schema_attendu:
+        return "Requête refusée : elle doit provenir de la même adresse que l’application.", 403
+    return None
+
+
+@app.after_request
+def ajouter_entetes_securite(reponse):
+    reponse.headers.setdefault("X-Content-Type-Options", "nosniff")
+    reponse.headers.setdefault("X-Frame-Options", "DENY")
+    reponse.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    reponse.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    reponse.headers.setdefault("Permissions-Policy", "camera=(), geolocation=(), microphone=()")
+    via_proxy = request.headers.get("X-Forwarded-For") or request.headers.get("CF-Connecting-IP")
+    proto_proxy = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+    if request.is_secure or (via_proxy and proto_proxy == "https"):
+        reponse.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return reponse
+
+
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    if request.method == "GET":
+        jeton = os.environ.get("WA_VERIFY_TOKEN", "")
+        if jeton and request.args.get("hub.mode") == "subscribe" and \
+                hmac.compare_digest(request.args.get("hub.verify_token", ""), jeton):
+            return request.args.get("hub.challenge", ""), 200
+        return "interdit", 403
+    secret = os.environ.get("WA_APP_SECRET", "")
+    brut = request.get_data()
+    attendu = "sha256=" + hmac.new(secret.encode(), brut, hashlib.sha256).hexdigest() if secret else ""
+    if not secret or not hmac.compare_digest(attendu, request.headers.get("X-Hub-Signature-256", "")):
+        return "signature invalide", 403
+    threading.Thread(target=traiter_webhook, args=(request.get_json(silent=True) or {},), daemon=True).start()
+    return "ok", 200
+
+
+# ---------- page de contrôle et simulation ----------
+PAGE_WHATSAPP = BASE.replace("{% block corps %}{% endblock %}", """
+<style>
+.wa-hero{display:flex;justify-content:space-between;align-items:center;gap:18px;flex-wrap:wrap;padding:24px;margin-bottom:14px;border:1px solid rgba(19,163,85,.2);border-radius:20px;background:radial-gradient(ellipse at 90% 0%,rgba(19,163,85,.15),transparent 42%),linear-gradient(135deg,var(--card),var(--soft));box-shadow:var(--ombre)}
+.wa-hero h1{font-size:1.7rem;line-height:1.15;letter-spacing:-.035em;margin:0}.wa-hero p{margin:7px 0 0;color:var(--mut);max-width:66ch}.wa-kicker{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;font-weight:750;color:var(--vert);margin-bottom:8px}
+.wa-pills{display:flex;gap:7px;flex-wrap:wrap;margin-top:13px}.wa-pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:var(--soft);color:var(--mut);font-size:.78rem;font-weight:650}.wa-pill.ok{background:rgba(19,163,85,.14);color:var(--vert)}.wa-pill.warn{background:rgba(240,165,0,.16);color:#a87400}
+.wa-nav{display:flex;gap:8px;overflow-x:auto;margin:0 0 14px;padding-bottom:2px}.wa-nav a{white-space:nowrap;text-decoration:none;background:var(--card);border:1px solid var(--bord);border-radius:999px;padding:7px 12px;font-size:.8rem;font-weight:650;color:var(--txt)}.wa-nav a:hover{border-color:var(--vert2);color:var(--vert)}
+.wa-overview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:11px;margin-bottom:16px}.wa-metric{background:var(--card);border:1px solid var(--bord);border-radius:14px;padding:13px 15px;min-width:0;box-shadow:var(--ombre)}.wa-metric span{display:block;color:var(--mut);font-size:.76rem}.wa-metric b{display:block;margin-top:3px;font-size:1.08rem;overflow-wrap:anywhere}.wa-metric small{display:block;margin-top:3px;color:var(--mut);font-size:.72rem}
+.wa-panel{background:var(--card);border:1px solid var(--bord);border-radius:16px;padding:18px;margin-bottom:15px;box-shadow:var(--ombre);scroll-margin-top:14px}.wa-panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}.wa-panel-head h2{margin:0 0 4px}.wa-panel-head p{margin:0;color:var(--mut);font-size:.83rem}.wa-counter{white-space:nowrap}
+.wa-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.wa-group{border:1px solid var(--bord);border-radius:13px;padding:14px;min-width:0;background:var(--bg)}.wa-group-head{display:flex;align-items:center;gap:10px;margin-bottom:9px}.wa-group-icon{width:36px;height:36px;display:grid;place-items:center;flex:none;border-radius:11px;background:var(--soft);font-size:1.05rem}.wa-group-title{min-width:0;flex:1}.wa-group-title b{display:block;font-size:.9rem}.wa-group-title small{display:block;color:var(--mut);font-size:.73rem}.wa-group-count{font-size:.75rem;font-weight:750;color:var(--vert);white-space:nowrap}
+.wa-check{display:grid;grid-template-columns:22px minmax(0,1fr) auto;gap:8px;align-items:center;padding:9px 0;border-top:1px solid var(--bord)}.wa-check-icon{width:20px;height:20px;display:grid;place-items:center;border-radius:50%;font-size:.72rem;font-weight:800;background:rgba(19,163,85,.14);color:var(--vert)}.wa-check-icon.off{background:rgba(240,165,0,.16);color:#a87400}.wa-check-copy{min-width:0}.wa-check-copy b{display:block;font-size:.8rem}.wa-check-copy small{display:block;color:var(--mut);font-size:.71rem;overflow-wrap:anywhere}.wa-check-state{font-size:.68rem;font-weight:700;color:var(--vert);white-space:nowrap}.wa-check-state.off{color:#a87400}
+.wa-callout{margin-top:12px;padding:11px 13px;border-radius:11px;background:var(--soft);color:var(--mut);font-size:.8rem}.wa-callout code{overflow-wrap:anywhere}
+.wa-issue{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid var(--bord)}.wa-issue:last-child{border-bottom:0}.wa-issue-main{min-width:0}.wa-issue-main b{display:block}.wa-issue-main p{margin:3px 0 0;color:var(--mut);font-size:.8rem;overflow-wrap:anywhere}.wa-issue-actions{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end;flex:none}.wa-issue-actions .btn,.wa-issue-actions button{font-size:.77rem;padding:7px 11px}
+.wa-empty{display:flex;align-items:center;gap:11px;padding:15px;border-radius:12px;background:var(--soft);color:var(--mut);font-size:.86rem}.wa-empty b{color:var(--vert)}
+.wa-tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px}.wa-tool{border:1px solid var(--bord);border-radius:14px;padding:15px;min-width:0}.wa-tool h3{margin:0 0 5px;font-size:.95rem}.wa-tool>p{margin:0 0 10px;color:var(--mut);font-size:.8rem}.wa-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 12px}.wa-form-grid .wide{grid-column:1/-1}.wa-results{padding:11px 13px;margin-top:12px;border-radius:11px;background:var(--bg);font-size:.8rem}.wa-results p{margin:4px 0}
+.wa-journal-bar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:10px}.wa-journal-bar input{flex:1;min-width:200px}.wa-journal-bar select{width:auto;min-width:145px}.wa-journal-count{margin-left:auto;color:var(--mut);font-size:.78rem}.wa-log{min-width:760px}.wa-log td{font-size:.8rem}.wa-log td:nth-child(1){white-space:nowrap;color:var(--mut)}.wa-log td:nth-child(3){white-space:nowrap}.wa-direction{font-weight:700;color:var(--vert)}.wa-direction.in{color:#4266b2}.wa-message{max-width:400px}.wa-message summary{cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:390px}.wa-message div{white-space:pre-wrap;overflow-wrap:anywhere;max-width:460px;padding:6px 0;color:var(--mut)}.wa-log-status{font-size:.72rem;font-weight:700}.wa-log-status.error{color:var(--rouge)}.wa-log-status.sim{color:#a87400}
+@media(max-width:850px){.wa-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.wa-groups,.wa-tools{grid-template-columns:1fr}}
+@media(max-width:600px){.wa-hero{padding:18px 15px;border-radius:16px}.wa-hero h1{font-size:1.4rem}.wa-panel{padding:14px}.wa-panel-head{align-items:center}.wa-check{grid-template-columns:22px minmax(0,1fr)}.wa-check-state{grid-column:2}.wa-form-grid{grid-template-columns:1fr}.wa-form-grid .wide{grid-column:auto}.wa-issue{align-items:flex-start;flex-direction:column}.wa-issue-actions{justify-content:flex-start}.wa-journal-count{width:100%;margin-left:0}}
+</style>
+<header class="wa-hero">
+ <div><div class="wa-kicker">Centre de communication · LIR</div><h1>WhatsApp &amp; automatisations</h1>
+ <p>Vérifie les connexions, suis les commandes qui demandent ton attention, puis teste le parcours sans envoyer de vrai message.</p>
+ <div class="wa-pills"><span class="wa-pill {{ 'ok' if wa_ready else 'warn' }}">{{ '● Identifiants WhatsApp présents' if wa_ready else '● Identifiants à configurer' }}</span>
+ <span class="wa-pill">Mode {{ 'manuel' if mode_manuel else 'automatique' }}</span><span class="wa-pill">{{ verifs_ok }}/{{ verifs_total }} réglages actifs</span></div></div>
+ <a class="btn sec" href="{{ url_for('parametres') }}">⚙️ Paramètres généraux</a>
+</header>
+<nav class="wa-nav" aria-label="Raccourcis WhatsApp">
+ <a href="#wa-config">Configuration</a><a href="#wa-attention">À traiter · {{ att|length }}</a><a href="#wa-tests">Outils de test</a><a href="#wa-journal">Historique · {{ journal_total }}</a>
+</nav>
+<div class="wa-overview">
+ <div class="wa-metric"><span>Connexion Meta</span><b>{{ 'Identifiants présents' if wa_ready else 'À configurer' }}</b><small>Présence du jeton et de l’identifiant du numéro</small></div>
+ <div class="wa-metric"><span>Mode de traitement</span><b>{{ 'Validation manuelle' if mode_manuel else 'Automatique' }}</b><small>{{ 'Tu contrôles avant l’envoi' if mode_manuel else 'Les règles actives traitent les messages' }}</small></div>
+ <div class="wa-metric"><span>À traiter</span><b>{{ att|length }} élément{{ '' if att|length == 1 else 's' }}</b><small>Commandes à vérifier ou compléter</small></div>
+ <div class="wa-metric"><span>Historique conservé</span><b>{{ journal_total }} message{{ '' if journal_total == 1 else 's' }}</b><small>Les 40 derniers sont affichés ici</small></div>
+</div>
+<section class="wa-panel" id="wa-config">
+ <div class="wa-panel-head"><div><h2>🔌 Connexion et réglages</h2><p>Les secrets restent dans les variables de Windows ; cette page n’affiche que leur état.</p></div><span class="pastille wa-counter">{{ verifs_ok }}/{{ verifs_total }}</span></div>
+ <div class="wa-groups">
+ {% for g in groupes %}
+ <article class="wa-group"><div class="wa-group-head"><span class="wa-group-icon">{{ g.icone }}</span><div class="wa-group-title"><b>{{ g.titre }}</b><small>{{ g.description }}</small></div><span class="wa-group-count">{{ g.ok }}/{{ g.total }}</span></div>
+ {% for v in g["items"] %}<div class="wa-check"><span class="wa-check-icon {{ '' if v.ok else 'off' }}">{{ '✓' if v.ok else '!' }}</span>
+ <div class="wa-check-copy"><b>{{ v.nom }}</b><small>{{ v.aide }} · <code>{{ v.variable }}</code></small></div>
+ <span class="wa-check-state {{ '' if v.ok else 'off' }}">{{ 'Actif' if v.ok else ('Facultatif' if v.optionnel else 'À configurer') }}</span></div>{% endfor %}
+ </article>
+ {% endfor %}
+ </div>
+ <div class="wa-callout"><b>Adresse du webhook Meta :</b>
+ {% if webhook_url %}<code id="wa-webhook">{{ webhook_url }}</code> <button class="sec" type="button" onclick="copierWebhook(this)">Copier</button>
+ {% else %}<span>ajoute d’abord <code>URL_PUBLIQUE</code>, puis utilise son adresse suivie de <code>/webhook</code>.</span>{% endif %}
+ </div>
+</section>
+<section class="wa-panel" id="wa-attention">
+ <div class="wa-panel-head"><div><h2>⚠️ Commandes à traiter</h2><p>Demandes bloquées, incomplètes ou nécessitant une vérification humaine.</p></div><span class="pastille {{ 'rouge' if att else '' }}">{{ att|length }}</span></div>
+ {% for r in att %}<div class="wa-issue"><div class="wa-issue-main"><b>{{ r.numero }} · {{ r.client_nom or r.client_tel or 'Client sans numéro' }}</b><p><span class="tag">{{ etat_wa(r.auto_etat) }}</span> {{ r.auto_note or 'Vérifie les informations de la commande.' }}</p></div>
+ <div class="wa-issue-actions"><a class="btn sec" href="{{ url_for('modifier', id=r.id) }}">Ouvrir la commande</a><form class="inline" method="post" action="{{ url_for('traite_wa', id=r.id) }}"><button class="sec">Marquer traité</button></form></div></div>
+ {% else %}<div class="wa-empty"><span>✅</span><div><b>Tout est à jour.</b><br>Aucune commande WhatsApp ne demande ton intervention.</div></div>{% endfor %}
+</section>
+<section class="wa-panel" id="wa-tests">
+ <div class="wa-panel-head"><div><h2>🧪 Outils de test</h2><p>Teste séparément l’intelligence artificielle et le parcours WhatsApp simulé.</p></div></div>
+ <div class="wa-tools">
+  <article class="wa-tool"><h3>🔑 Vérifier Gemini</h3><p>Teste la clé IA puis l’analyse d’un exemple de commande. Aucun message WhatsApp n’est envoyé.</p>
+   <form method="post" action="{{ url_for('whatsapp') }}"><input type="hidden" name="action" value="test_ia"><button>Tester la clé IA</button></form>
+   {% if tests_ia is not none %}<div class="wa-results">{% for t in tests_ia %}<p>{{ t }}</p>{% endfor %}</div>{% endif %}
+  </article>
+  <article class="wa-tool"><h3>💬 Simuler un message entrant</h3><p>La simulation n’envoie rien au client et marque les commandes créées avec <code>[TEST]</code>.</p>
+   <form method="post" action="{{ url_for('simuler_wa') }}"><div class="wa-form-grid">
+    <div><label>Numéro client ou livreur</label><input name="de" placeholder="70123456" required></div>
+    <div><label>Bouton livreur (facultatif)</label><input name="bouton" placeholder="collecte:3 ou livre:3"></div>
+    <div class="wide"><label>Message à simuler</label><input name="texte" placeholder="Ex. Récupérer 2 poulets à Pissy, livrer à Tanghin"></div>
+   </div><p><button>▶ Simuler le message</button></p></form>
+   <form method="post" action="{{ url_for('nettoyer_wa') }}" onsubmit="return confirm('Supprimer uniquement les commandes et messages de test [TEST] ?')">
+    <button class="sec">Nettoyer les données de test</button></form>
+  </article>
+ </div>
+</section>
+<section class="wa-panel" id="wa-journal">
+ <div class="wa-panel-head"><div><h2>🗂️ Historique des messages</h2><p>Retrouve les échanges récents et filtre-les par numéro, contenu ou type.</p></div></div>
+ <div class="wa-journal-bar"><input id="wa-recherche" type="search" placeholder="🔎 Rechercher un numéro, un message, un type…">
+  <select id="wa-sens" aria-label="Filtrer par sens"><option value="">Tous les sens</option><option value="in">Entrants</option><option value="out">Sortants</option></select>
+  <select id="wa-etat" aria-label="Filtrer par état"><option value="">Tous les états</option><option value="erreur">En erreur</option><option value="simule">Simulés</option><option value="envoye">Envoyés</option></select>
+  <span class="wa-journal-count" id="wa-resultats">{{ journal|length }} affiché{{ '' if journal|length == 1 else 's' }} / {{ journal_total }}</span>
+ </div>
+ <div class="scroll"><table class="wa-log" id="wa-table"><thead><tr><th>Date</th><th>Sens</th><th>Numéro</th><th>Type</th><th>Message</th><th>État</th></tr></thead><tbody>
+ {% for m in journal %}<tr data-sens="{{ m.sens or '' }}" data-etat="{{ 'simule' if m.statut == 'simulé' else ('erreur' if 'échec' in (m.statut or '') or 'erreur' in (m.statut or '') else ('envoye' if 'envoyé' in (m.statut or '') else 'autre')) }}">
+  <td>{{ m.cree_le }}</td><td><span class="wa-direction {{ 'in' if m.sens == 'in' else 'out' }}">{{ 'Entrant' if m.sens == 'in' else 'Sortant' }}</span></td><td>{{ m.tel }}</td><td>{{ m.type }}</td>
+  <td><details class="wa-message"><summary>{{ (m.contenu or '')[:100] }}{{ '…' if (m.contenu or '')|length > 100 else '' }}</summary>{% if (m.contenu or '')|length > 100 %}<div>{{ m.contenu }}</div>{% endif %}</details></td>
+  <td><span class="wa-log-status {{ 'error' if 'échec' in (m.statut or '') or 'erreur' in (m.statut or '') else ('sim' if m.statut == 'simulé' else '') }}">{{ m.statut or 'Reçu' }}</span></td>
+ </tr>{% else %}<tr class="wa-sans-message"><td colspan="6" class="mut">Aucun message WhatsApp enregistré pour le moment.</td></tr>{% endfor %}
+ </tbody></table></div>
+</section>
+<script>
+function copierWebhook(b){const el=document.getElementById('wa-webhook');if(!el)return;navigator.clipboard.writeText(el.textContent).then(()=>{b.textContent='Copié ✓';setTimeout(()=>b.textContent='Copier',1600)}).catch(()=>alert('La copie automatique a échoué. Sélectionne et copie l’adresse manuellement.'))}
+(function(){const q=document.getElementById('wa-recherche'),sens=document.getElementById('wa-sens'),etat=document.getElementById('wa-etat'),rows=[...document.querySelectorAll('#wa-table tbody tr[data-sens]')],label=document.getElementById('wa-resultats');if(!q)return;function filtrer(){const terme=q.value.trim().toLocaleLowerCase(),s=sens.value,e=etat.value;let n=0;rows.forEach(r=>{const ok=(!terme||r.textContent.toLocaleLowerCase().includes(terme))&&(!s||r.dataset.sens===s)&&(!e||r.dataset.etat===e);r.hidden=!ok;if(ok)n++}label.textContent=n+' affiché'+(n===1?'':'s')+' / {{ journal_total }}')}q.addEventListener('input',filtrer);sens.addEventListener('change',filtrer);etat.addEventListener('change',filtrer)})();
+</script>
+""")
+
+
+def _raison_http(e):
+    try:
+        err = json.loads(e.read().decode("utf-8")).get("error", {})
+        return f"{err.get('status', '')} {err.get('message', '')}"[:260]
+    except Exception:
+        return ""
+
+
+def tester_ia():
+    """Deux appels de contrôle : un très simple, puis l'analyse réelle d'un message type."""
+    cle = os.environ.get("GEMINI_API_KEY", "")
+    if not cle:
+        return ["➖ Aucune clé Gemini enregistrée (GEMINI_API_KEY)."]
+    masque = f"clé {cle[:4]}…{cle[-3:]}, {len(cle)} caractères (les clés Google n'ont pas toutes le même format)"
+    sortie = [f"Clé lue par l'application : {masque}."]
+    try:
+        rep, modele = appel_gemini({"contents": [{"parts": [{"text": "Réponds uniquement par le mot OK"}]}]})
+        sortie.append(f"✅ Test 1 (appel simple, modèle {modele}) : réponse « " + rep["candidates"][0]["content"]["parts"][0]["text"].strip()[:30] + " »")
+    except urllib.error.HTTPError as e:
+        sortie.append(f"❌ Test 1 (appel simple) : HTTP {e.code} {_raison_http(e)}")
+        return sortie
+    except Exception as e:
+        return sortie + [f"❌ Test 1 : {type(e).__name__} : Google n'a pas répondu à temps (connexion internet lente ou coupée). "
+                         "Vérifie que d'autres sites s'ouvrent, puis réessaie."]
+    try:
+        d = extraire_avec_gemini("Récupérer 2 poulets au marché de Pissy et livrer à Tanghin")
+        sortie.append(f"✅ Test 2 (analyse d'un message) : collecte « {d.get('collecte_lieu')} / {d.get('collecte_quartier')} », livraison « {d.get('livraison_quartier')} »")
+    except urllib.error.HTTPError as e:
+        sortie.append(f"❌ Test 2 (analyse d'un message) : HTTP {e.code} {_raison_http(e)}")
+    except Exception as e:
+        sortie.append(f"❌ Test 2 : {type(e).__name__} {e}"[:260])
+    return sortie
+
+
+@app.route("/whatsapp", methods=["GET", "POST"])
+def whatsapp():
+    e = os.environ.get
+    groupes = [
+        {"titre": "Connexion & sécurité", "icone": "🔌",
+         "description": "Canal Meta, réception et protection de l’équipe",
+         "items": [
+             {"nom": "Envoi des messages", "ok": wa_configure(), "optionnel": False,
+              "aide": "Jeton permanent et identifiant du numéro fournis par Meta.",
+              "variable": "WA_TOKEN + WA_PHONE_ID"},
+             {"nom": "Réception des messages", "ok": bool(e("WA_VERIFY_TOKEN")), "optionnel": False,
+              "aide": "Secret de vérification à recopier dans la configuration du webhook Meta.",
+              "variable": "WA_VERIFY_TOKEN"},
+             {"nom": "Signature du webhook", "ok": bool(e("WA_APP_SECRET")), "optionnel": False,
+              "aide": "Vérifie que les notifications entrantes viennent bien de Meta.",
+              "variable": "WA_APP_SECRET"},
+             {"nom": "Mot de passe de l’équipe", "ok": bool(e("APP_MOT_DE_PASSE")), "optionnel": True,
+              "aide": "À définir avant d’ouvrir l’administration aux connexions extérieures.",
+              "variable": "APP_MOT_DE_PASSE"},
+         ]},
+        {"titre": "Compréhension des commandes", "icone": "🧠",
+         "description": "Analyse des textes et des messages vocaux",
+         "items": [
+             {"nom": "Analyse des messages", "ok": bool(e("GEMINI_API_KEY") or e("ANTHROPIC_API_KEY")),
+              "optionnel": True, "aide": "Au moins une clé IA pour interpréter les demandes écrites.",
+              "variable": "GEMINI_API_KEY ou ANTHROPIC_API_KEY"},
+             {"nom": "Transcription des vocaux", "ok": bool(e("GEMINI_API_KEY")), "optionnel": True,
+              "aide": "Permet de convertir les notes vocales en texte.",
+              "variable": "GEMINI_API_KEY"},
+         ]},
+        {"titre": "Messages & notifications", "icone": "✉️",
+         "description": "Modèles hors délai et alertes internes",
+         "items": [
+             {"nom": "Modèle pour les livreurs", "ok": bool(e("WA_TEMPLATE_LIVREUR")), "optionnel": True,
+              "aide": "Autorise les notifications au livreur hors de la fenêtre de 24 h.",
+              "variable": "WA_TEMPLATE_LIVREUR"},
+             {"nom": "Modèle pour les clients", "ok": bool(e("WA_TEMPLATE_CLIENT")), "optionnel": True,
+              "aide": "Autorise les notifications client hors de la fenêtre de 24 h.",
+              "variable": "WA_TEMPLATE_CLIENT"},
+             {"nom": "Alerte à la personne de confiance", "ok": bool(e("WA_SECRETAIRE")), "optionnel": True,
+              "aide": "Numéro averti quand une commande nécessite un suivi particulier.",
+              "variable": "WA_SECRETAIRE"},
+         ]},
+        {"titre": "Boutique & accès public", "icone": "🌐",
+         "description": "Contact boutique et accès depuis l’extérieur",
+         "items": [
+             {"nom": "Numéro WhatsApp de la boutique", "ok": bool(e("WA_NUMERO_PUBLIC")), "optionnel": True,
+              "aide": "Numéro visible par les clients pour passer commande.",
+              "variable": "WA_NUMERO_PUBLIC"},
+             {"nom": "Accès public boutique et portails", "ok": e("BOUTIQUE_PUBLIQUE") == "1",
+              "optionnel": True, "aide": "À activer pour publier la boutique et les espaces partenaires/livreurs.",
+              "variable": "BOUTIQUE_PUBLIQUE"},
+             {"nom": "Adresse publique", "ok": bool(e("URL_PUBLIQUE")), "optionnel": True,
+              "aide": "Adresse sécurisée du tunnel à transmettre à Meta et aux utilisateurs.",
+              "variable": "URL_PUBLIQUE"},
+         ]},
+    ]
+    verifs_total = sum(len(g["items"]) for g in groupes)
+    verifs_ok = sum(sum(1 for v in g["items"] if v["ok"]) for g in groupes)
+    for groupe in groupes:
+        groupe["ok"] = sum(1 for v in groupe["items"] if v["ok"])
+        groupe["total"] = len(groupe["items"])
+    mode_manuel = e("WA_MODE", "auto").lower() == "manuel"
+    webhook_url = e("URL_PUBLIQUE", "").rstrip("/") + "/webhook" if e("URL_PUBLIQUE") else ""
+    with db() as con:
+        journal = con.execute("SELECT * FROM messages_wa ORDER BY rowid DESC LIMIT 40").fetchall()
+        journal_total = con.execute("SELECT COUNT(*) FROM messages_wa").fetchone()[0]
+    test_demande = request.method == "POST" and request.form.get("action") == "test_ia"
+    return render_template_string(
+        PAGE_WHATSAPP, groupes=groupes, verifs_ok=verifs_ok, verifs_total=verifs_total,
+        wa_ready=wa_configure(), mode_manuel=mode_manuel, webhook_url=webhook_url,
+        journal=journal, journal_total=journal_total, att=a_traiter(),
+        tests_ia=tester_ia() if test_demande else None)
+
+
+@app.route("/whatsapp/simuler", methods=["POST"])
+def simuler_wa():
+    de, texte, bouton = chiffres(request.form.get("de", "")), request.form.get("texte", "").strip(), request.form.get("bouton", "").strip()
+    if de and (texte or bouton):
+        with db() as con:
+            est_livreur = con.execute("SELECT 1 FROM livreurs WHERE tel=? AND tel!=''", (de,)).fetchone()
+        if texte and not est_livreur and not texte.startswith("[TEST]"):
+            texte = "[TEST] " + texte
+        _ctx.sim = True
+        try:
+            traiter_message({"id": f"sim-{uuid.uuid4().hex[:10]}", "from": "226" + de, "type": "interactive" if bouton else "text",
+                             "texte": texte, "bouton": bouton, "media": "", "nom": "Test"})
+        except Exception as e:
+            journaliser_wa(None, "in", de, "erreur", f"{type(e).__name__}: {e}", None, "erreur")
+        finally:
+            _ctx.sim = False
+    return redirect(url_for("whatsapp"))
+
+
+@app.route("/whatsapp/nettoyer", methods=["POST"])
+def nettoyer_wa():
+    with db() as con:
+        ids = [r[0] for r in con.execute("SELECT id FROM livraisons WHERE message_original LIKE '[TEST]%'")]
+        for i in ids:
+            con.execute("DELETE FROM messages_wa WHERE livraison_id=?", (i,))
+            con.execute("DELETE FROM livraisons WHERE id=?", (i,))
+        con.execute("DELETE FROM messages_wa WHERE statut='simulé' OR id LIKE 'sim-%'")
+    return redirect(url_for("whatsapp"))
+
+
+@app.route("/whatsapp/traite/<int:id>", methods=["POST"])
+def traite_wa(id):
+    marquer(id, "", "")
+    return redirect(request.referrer or url_for("accueil"))
+
+
+# ===================== V9 : solidité, relance des livreurs, mémoire des clients =====================
+# Réglages facultatifs (variables d'environnement) :
+#   APP_MOT_DE_PASSE   : protège l'administration sur le réseau ; sans lui, elle est limitée à ce PC
+#   WA_RELANCE_MIN     : minutes sans réponse du livreur avant un rappel (10 par défaut)
+#   WA_REASSIGNE_MIN   : minutes après le rappel avant de passer au livreur suivant (10 par défaut)
+
+# ---------- mot de passe facultatif ----------
+@app.before_request
+def demander_mot_de_passe():
+    mdp = os.environ.get("APP_MOT_DE_PASSE", "")
+    if not mdp or chemin_public(request.path):
+        return None
+    a = request.authorization
+    if a and hmac.compare_digest((a.password or "").encode("utf-8"), mdp.encode("utf-8")):
+        return None
+    return Response("Mot de passe requis", 401, {"WWW-Authenticate": 'Basic realm="Livraisons"'})
+
+
+# ---------- nouvelles colonnes ----------
+def migrer_v9(con):
+    existantes = {r[1] for r in con.execute("PRAGMA table_info(livraisons)")}
+    for col, defaut in (("envoye_le", "''"), ("relances", "0"), ("essayes", "''")):
+        if col not in existantes:
+            typ = "INTEGER" if col == "relances" else "TEXT"
+            con.execute(f"ALTER TABLE livraisons ADD COLUMN {col} {typ} DEFAULT {defaut}")
+
+
+_init_db_base = init_db
+
+
+def init_db():
+    _init_db_base()
+    with db() as con:
+        migrer_v9(con)
+
+
+# ---------- alerte à la personne de confiance (WA_SECRETAIRE) ----------
+def alerter_equipe(texte, livraison_id=None):
+    sec = os.environ.get("WA_SECRETAIRE")
+    if sec:
+        try:
+            envoyer(sec, texte, type_="alerte", livraison_id=livraison_id)
+        except Exception:
+            log.exception("Alerte non envoyée")
+
+
+# ---------- confirmation immédiate au client ----------
+MESSAGES_CLIENT["recu_attente"] = ("Bonjour{nom}, votre commande {numero} est bien reçue ✅ Livraison à : {lieu}. "
+                                   "Nous cherchons le livreur le plus proche et vous prévenons dès qu'il est en route. "
+                                   "Si ce n'est pas la bonne adresse, contactez-nous. - {entreprise}")
+MESSAGES_CLIENT["reassigne"] = ("Bonjour{nom}, pour votre commande {numero}, votre livreur est maintenant {livreur}. "
+                                "Il se rend au lieu de collecte. - {entreprise}")
+
+
+def accuser_reception(id):
+    """Prévient le client tout de suite que sa commande est enregistrée (une seule fois par commande)."""
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+        deja = con.execute("SELECT 1 FROM messages_wa WHERE livraison_id=? AND type='recu_attente' AND sens='out'",
+                           (id,)).fetchone()
+    if not l or deja or not l["client_tel"]:
+        return
+    lieu = ", ".join(x for x in (l["livraison_adresse"], l["livraison_quartier"]) if x) or "à préciser"
+    texte = texte_client("recu_attente", l, lieu=lieu)
+    envoyer(l["client_tel"], texte, modele=("WA_TEMPLATE_CLIENT", [texte], []), type_="recu_attente", livraison_id=id)
+
+
+# ---------- mémoire des clients : « chez moi » ----------
+MOTS_CHEZ_MOI = re.compile(r"\b(chez moi|a la maison|chez nous|a domicile|meme adresse|comme d'habitude|comme d habitude)\b")
+
+
+def completer_depuis_historique(v, tel, texte):
+    """Si le client écrit « chez moi » sans préciser, reprend l'adresse de sa dernière commande."""
+    try:
+        if v["livraison_adresse"] or v["livraison_quartier"]:
+            return v
+        if not MOTS_CHEZ_MOI.search(normaliser(texte)):
+            return v
+        with db() as con:
+            r = con.execute("SELECT numero, livraison_adresse, livraison_quartier FROM livraisons "
+                            "WHERE client_tel=? AND (livraison_adresse!='' OR livraison_quartier!='') "
+                            "AND COALESCE(message_original,'') NOT LIKE '[TEST]%' ORDER BY id DESC LIMIT 1", (tel,)).fetchone()
+        if not r:
+            return v
+        v = dict(v, livraison_adresse=r["livraison_adresse"] or "", livraison_quartier=r["livraison_quartier"] or "")
+        note = f"Adresse reprise de la dernière commande ({r['numero']}) : à confirmer si besoin"
+        v["remarques"] = (v["remarques"] + " | " if v["remarques"] else "") + note
+    except Exception:
+        log.exception("Mémoire client impossible")
+    return v
+
+
+# ---------- on note l'heure et le livreur à chaque envoi de commande ----------
+_envoyer_commande_base = envoyer_commande_livreur
+
+
+def envoyer_commande_livreur(l):
+    ok, d = _envoyer_commande_base(l)
+    if ok:
+        try:
+            essayes = [x for x in ((l["essayes"] if "essayes" in l.keys() else "") or "").split("|") if x]
+            if l["livreur"] not in essayes:
+                essayes.append(l["livreur"])
+            with db() as con:
+                con.execute("UPDATE livraisons SET envoye_le=?, essayes=? WHERE id=?",
+                            (maintenant(), "|".join(essayes), l["id"]))
+        except Exception:
+            log.exception("Heure d'envoi non notée")
+    return ok, d
+
+
+# ---------- relance puis réassignation automatique ----------
+def _boutons_livreur(l):
+    return [(f"collecte:{l['id']}", "✅ Récupéré"), (f"livre:{l['id']}", "🏁 Livré"), (f"probleme:{l['id']}", "⚠️ Problème")]
+
+
+def relancer_livreur(l):
+    with db() as con:
+        lv = con.execute("SELECT * FROM livreurs WHERE nom=?", (l["livreur"],)).fetchone()
+    if not lv or not lv["tel"]:
+        return
+    texte = f"⏰ Rappel : la commande {l['numero']} attend d'être récupérée. Où en es-tu ?\n" + texte_commande(l)
+    b = _boutons_livreur(l)
+    envoyer(lv["tel"], texte, b, ("WA_TEMPLATE_LIVREUR", [l["numero"], texte], [x[0] for x in b]), "relance", l["id"])
+    with db() as con:
+        con.execute("UPDATE livraisons SET relances=1, envoye_le=? WHERE id=?", (maintenant(), l["id"]))
+
+
+def reassigner(l):
+    id = l["id"]
+    essayes = [x for x in (l["essayes"] or "").split("|") if x]
+    collecte = ", ".join(x for x in (l["collecte_lieu"], l["collecte_quartier"]) if x)
+    with db() as con:
+        tels = {r["nom"]: r["tel"] for r in con.execute("SELECT nom, tel FROM livreurs")}
+    try:
+        liste, _ = classer_livreurs(collecte, l["collecte_quartier"] or "")
+        suivants = [x for x in liste if x["nom"] not in essayes and tels.get(x["nom"])]
+    except Exception:
+        log.exception("Classement des livreurs impossible pour %s", l["numero"])
+        suivants = []
+    with db() as con:
+        con.execute("UPDATE livraisons SET envoye_le='' WHERE id=?", (id,))  # on ne retraite pas cette commande en boucle
+    if not suivants:
+        note = f"Aucun livreur n'a confirmé {l['numero']} (essayés : {', '.join(essayes) or '-'}) : à gérer à la main"
+        marquer(id, "a_verifier", note)
+        alerter_equipe("⚠️ " + note, id)
+        return
+    ancien, nouveau = l["livreur"], suivants[0]["nom"]
+    with db() as con:
+        con.execute("UPDATE livraisons SET livreur=?, relances=0 WHERE id=?", (nouveau, id))
+        l2 = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+    if tels.get(ancien):
+        envoyer(tels[ancien], f"ℹ️ La commande {l['numero']} a été confiée à un autre livreur. Ne la récupère pas.",
+                type_="aide", livraison_id=id)
+    ok, d = envoyer_commande_livreur(l2)
+    if not ok:
+        note = f"Commande non transmise à {nouveau} ({msg_erreur(d)})"
+        marquer(id, "erreur_envoi", note)
+        alerter_equipe(f"⚠️ {l['numero']} : {note}", id)
+        return
+    if l["client_tel"]:
+        texte = texte_client("reassigne", l2)
+        envoyer(l["client_tel"], texte, modele=("WA_TEMPLATE_CLIENT", [texte], []), type_="reassigne", livraison_id=id)
+
+
+def verifier_relances():
+    if not wa_configure() or os.environ.get("WA_MODE", "auto").lower() == "manuel":
+        return
+    d1 = int(os.environ.get("WA_RELANCE_MIN", "10") or 10)
+    d2 = int(os.environ.get("WA_REASSIGNE_MIN", "10") or 10)
+    with db() as con:
+        lignes = con.execute("SELECT id FROM livraisons WHERE statut='en attente' AND canal='WhatsApp' "
+                             "AND COALESCE(envoye_le,'')!='' AND COALESCE(auto_etat,'')='' "
+                             "AND COALESCE(message_original,'') NOT LIKE '[TEST]%'").fetchall()
+    for r in lignes:
+        with db() as con:  # on relit : le livreur a peut-être répondu entre-temps
+            l = con.execute("SELECT * FROM livraisons WHERE id=?", (r["id"],)).fetchone()
+        if not l or l["statut"] != "en attente" or l["auto_etat"] or not l["envoye_le"]:
+            continue
+        minutes = (datetime.now() - datetime.strptime(l["envoye_le"], "%Y-%m-%d %H:%M")).total_seconds() / 60
+        try:
+            if not l["relances"] and minutes >= d1:
+                relancer_livreur(l)
+            elif l["relances"] and minutes >= d2:
+                reassigner(l)
+        except Exception:
+            log.exception("Relance impossible pour %s", l["numero"])
+
+
+def boucle_relance():
+    while True:
+        time.sleep(60)
+        try:
+            verifier_relances()
+        except Exception:
+            log.exception("Boucle de relance")
+
+
+# ===================== V10 : partenaires, catalogue, commissions, boutique clients =====================
+# Le circuit : un partenaire (restaurant, pharmacie, boutique...) a un catalogue d'articles. Un client commande
+# (boutique, message WhatsApp, ou toi à sa place) ; la commande se crée avec le lieu de collecte du partenaire,
+# le montant des articles et ta commission. À la livraison, le solde entre toi et le partenaire se met à jour.
+#
+# Réglages facultatifs (variables d'environnement) :
+#   WA_NUMERO_PUBLIC   : numéro WhatsApp montré aux clients dans la boutique, ex : 22670123456
+#   BOUTIQUE_PUBLIQUE  : mettre 1 pour rendre accessibles par tunnel la boutique et les portails à comptes
+#                        (sinon seul /webhook l'est, comme avant)
+TAUX_DEFAUT = 10.0
+EXTRA_V10 = """
+CREATE TABLE IF NOT EXISTS partenaires (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, categorie TEXT DEFAULT '', tel TEXT DEFAULT '',
+  adresse TEXT DEFAULT '', quartier TEXT DEFAULT '', alias TEXT DEFAULT '', description TEXT DEFAULT '',
+  photo TEXT DEFAULT '', commission_pct REAL DEFAULT 10, frais_fixe REAL DEFAULT 0, course_defaut REAL DEFAULT 0,
+  encaisse_par TEXT DEFAULT 'nous', actif INTEGER DEFAULT 1, cree_le TEXT);
+CREATE TABLE IF NOT EXISTS articles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, partenaire_id INTEGER, nom TEXT, description TEXT DEFAULT '',
+  prix REAL DEFAULT 0, photo TEXT DEFAULT '', dispo INTEGER DEFAULT 1, cree_le TEXT);
+CREATE TABLE IF NOT EXISTS lignes_commande (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, livraison_id INTEGER, article_id INTEGER, nom TEXT, prix REAL, quantite INTEGER);
+CREATE TABLE IF NOT EXISTS versements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, partenaire_id INTEGER, montant REAL, sens TEXT, note TEXT DEFAULT '', cree_le TEXT);
+CREATE TABLE IF NOT EXISTS mouvements_caisse (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, sens TEXT NOT NULL, categorie TEXT NOT NULL,
+  montant INTEGER NOT NULL CHECK(montant > 0), moyen TEXT NOT NULL, date_operation TEXT NOT NULL,
+  note TEXT DEFAULT '', cree_le TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS clotures_caisse (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, date_cloture TEXT NOT NULL, moyen TEXT NOT NULL,
+  solde_ouverture INTEGER NOT NULL DEFAULT 0, solde_reel INTEGER NOT NULL DEFAULT 0,
+  note TEXT DEFAULT '', cree_le TEXT NOT NULL, UNIQUE(date_cloture, moyen));
+CREATE TABLE IF NOT EXISTS photos (nom TEXT PRIMARY KEY, type TEXT, donnees BLOB);
+"""
+
+
+def chemin_public(p):
+    """Routes de boutique et de compte, séparées de l'espace administrateur."""
+    if p == "/webhook":
+        return True
+    return chemin_portail(p)
+
+
+def chemin_portail(p):
+    return (p in {"/boutique", "/connexion", "/deconnexion", "/compte/profil", "/espace", "/portail-livreur"}
+            or p.startswith(("/boutique/", "/photo/", "/espace/", "/portail-livreur/")))
+
+
+def migrer_v10(con):
+    con.executescript(EXTRA_V10)
+    existantes = {r[1] for r in con.execute("PRAGMA table_info(livraisons)")}
+    for col, typ in (("partenaire_id", "INTEGER DEFAULT 0"), ("commission_pct_appl", "REAL DEFAULT 0"),
+                     ("frais_fixe_appl", "REAL DEFAULT 0"), ("encaisse_par_appl", "TEXT DEFAULT ''")):
+        if col not in existantes:
+            con.execute(f"ALTER TABLE livraisons ADD COLUMN {col} {typ}")
+    colonnes_versements = {r[1] for r in con.execute("PRAGMA table_info(versements)")}
+    if "moyen" not in colonnes_versements:
+        con.execute("ALTER TABLE versements ADD COLUMN moyen TEXT DEFAULT 'Autre'")
+
+
+_init_db_v9 = init_db
+
+
+def init_db():
+    _init_db_v9()
+    with db() as con:
+        migrer_v10(con)
+
+
+# ---------- photos (stockées dans la base : elles suivent les sauvegardes) ----------
+TAILLE_PHOTO_MAX = 1_500_000
+
+
+def enregistrer_photo(fichier):
+    """Retourne le nom de la photo enregistrée, ou '' si aucun fichier. Lève ValueError si le fichier est refusé."""
+    if not fichier or not fichier.filename:
+        return ""
+    brut = fichier.read(TAILLE_PHOTO_MAX + 1)
+    if len(brut) > TAILLE_PHOTO_MAX:
+        raise ValueError("Photo trop lourde (1,5 Mo maximum)")
+    if brut[:3] == b"\xff\xd8\xff":
+        typ = "image/jpeg"
+    elif brut[:8] == b"\x89PNG\r\n\x1a\n":
+        typ = "image/png"
+    elif brut[:4] == b"RIFF" and brut[8:12] == b"WEBP":
+        typ = "image/webp"
+    else:
+        raise ValueError("Format de photo accepté : JPG, PNG ou WEBP")
+    nom = secrets.token_hex(8)
+    with db() as con:
+        con.execute("INSERT INTO photos(nom, type, donnees) VALUES (?,?,?)", (nom, typ, brut))
+    return nom
+
+
+def supprimer_photo(nom):
+    if nom:
+        with db() as con:
+            con.execute("DELETE FROM photos WHERE nom=?", (nom,))
+
+
+@app.route("/photo/<nom>")
+def photo(nom):
+    with db() as con:
+        r = con.execute("SELECT type, donnees FROM photos WHERE nom=?", (nom,)).fetchone()
+    if not r:
+        abort(404)
+    return Response(r["donnees"], mimetype=r["type"],
+                    headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"})
+
+
+# ---------- commission et solde ----------
+def calcul_ligne(l):
+    """Pour une livraison liée à un partenaire : (ventes, commission, net pour le partenaire, effet sur le solde).
+    Solde > 0 : nous devons de l'argent au partenaire. Solde < 0 : le partenaire nous doit de l'argent."""
+    prod = l["valeur_produit"] or 0
+    com = round(prod * (l["commission_pct_appl"] or 0) / 100 + (l["frais_fixe_appl"] or 0))
+    effet = -com if (l["encaisse_par_appl"] or "nous") == "partenaire" else prod - com
+    return prod, com, prod - com, effet
+
+
+def bilan_partenaire(pid, mois=None):
+    with db() as con:
+        toutes = con.execute("SELECT * FROM livraisons WHERE partenaire_id=? AND statut='livré' ORDER BY id", (pid,)).fetchall()
+        encours = con.execute("SELECT COUNT(*) FROM livraisons WHERE partenaire_id=? AND statut IN ('en attente','collecté')",
+                              (pid,)).fetchone()[0]
+        vers = con.execute("SELECT * FROM versements WHERE partenaire_id=? ORDER BY id DESC", (pid,)).fetchall()
+    lignes = [l for l in toutes if not mois or (l["heure_livraison"] or l["cree_le"] or "")[:7] == mois]
+    detail = [(l,) + calcul_ligne(l) for l in lignes]  # (livraison, ventes, commission, net, effet)
+    aux = sum(v["montant"] for v in vers if v["sens"] == "aux_partenaire")
+    du = sum(v["montant"] for v in vers if v["sens"] == "du_partenaire")
+    solde = sum(calcul_ligne(l)[3] for l in toutes) - aux + du
+    return {"detail": detail, "nb": len(detail), "ventes": sum(d[1] for d in detail), "commission": sum(d[2] for d in detail),
+            "net": sum(d[3] for d in detail), "solde": solde, "encours": encours, "versements": vers}
+
+
+# ---------- reconnaissance du catalogue dans un message ----------
+def _cle(t):
+    """Texte comparable : minuscules, sans accents ni ponctuation, pluriels simplifiés, espaces aux deux bouts."""
+    s = " " + re.sub(r"[^a-z0-9]+", " ", normaliser(t)).strip() + " "
+    return re.sub(r"(?<=[a-z0-9]{3})[sx](?= )", "", s)
+
+
+# les petits mots passent par la même simplification que le texte (« trois » devient « troi » comme dans le message)
+MOTS_NOMBRES = {_cle(k).strip(): v for k, v in {"un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5, "six": 6,
+                                                  "sept": 7, "huit": 8, "neuf": 9, "dix": 10}.items()}
+MOTS_IGNORES = {_cle(k).strip() for k in ("x", "fois", "de", "d", "du", "des")}
+
+
+def _quantite(texte, i, k):
+    for t in reversed(texte[:i].split()[-4:]):
+        if t.isdigit():
+            return max(1, min(int(t), 99))
+        if t in MOTS_NOMBRES:
+            return MOTS_NOMBRES[t]
+        if t not in MOTS_IGNORES:
+            break
+    apres = texte[i + len(k) + 2:].split()[:1]
+    if apres and re.fullmatch(r"x\d{1,2}", apres[0]):
+        return int(apres[0][1:])
+    return 1
+
+
+def articles_dans(texte, articles):
+    trouves = []
+    for a in articles:
+        k = _cle(a["nom"]).strip()
+        i = texte.find(" " + k + " ") if len(k) >= 3 else -1
+        if i >= 0:
+            trouves.append((a, _quantite(texte, i, k)))
+    return trouves
+
+
+def resume_lignes(lignes):
+    return ", ".join(f"{q} x {a['nom']}" for a, q in lignes)
+
+
+def appliquer_partenaire(id, p, lignes, ecraser_collecte=True):
+    """Relie la livraison au partenaire : collecte, montant des articles, prix de course par défaut, taux de commission."""
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+        maj = {"partenaire_id": p["id"], "commission_pct_appl": p["commission_pct"] or 0,
+               "frais_fixe_appl": p["frais_fixe"] or 0, "encaisse_par_appl": p["encaisse_par"] or "nous"}
+        if ecraser_collecte or not (l["collecte_lieu"] or l["collecte_quartier"]):
+            maj["collecte_lieu"] = ", ".join(x for x in (p["nom"], p["adresse"]) if x)
+            maj["collecte_quartier"] = p["quartier"] or l["collecte_quartier"] or ""
+        if not l["prix_course"] and p["course_defaut"]:
+            maj["prix_course"] = p["course_defaut"]
+        note = f"Partenaire : {p['nom']}"
+        if lignes:
+            maj["valeur_produit"] = sum(prix_effectif(a) * q for a, q in lignes)
+            if not l["colis"]:
+                maj["colis"] = resume_lignes(lignes)
+            con.execute("DELETE FROM lignes_commande WHERE livraison_id=?", (id,))
+            con.executemany("INSERT INTO lignes_commande(livraison_id, article_id, nom, prix, quantite) VALUES (?,?,?,?,?)",
+                            [(id, a["id"], a["nom"], prix_effectif(a), q) for a, q in lignes])
+        else:
+            note += " (articles non reconnus : vérifier le montant)"
+        maj["remarques"] = (l["remarques"] + " | " if l["remarques"] else "") + note
+        con.execute(f"UPDATE livraisons SET {','.join(c + '=?' for c in maj)} WHERE id=?", [*maj.values(), id])
+
+
+def lier_catalogue(id):
+    """Appelé pour chaque commande reçue par WhatsApp : reconnaît le partenaire et les articles cités par le client."""
+    try:
+        with db() as con:
+            l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+            if not l or l["partenaire_id"]:
+                return
+            parts = con.execute("SELECT * FROM partenaires WHERE actif=1").fetchall()
+            arts = con.execute("SELECT a.* FROM articles a JOIN partenaires p ON p.id=a.partenaire_id "
+                               "WHERE a.dispo=1 AND p.actif=1").fetchall()
+        texte = _cle(l["message_original"] or "")
+        trouves = articles_dans(texte, arts)
+        cites = []
+        for p in parts:
+            for n in [p["nom"]] + (p["alias"] or "").split(","):
+                k = _cle(n).strip()
+                if len(k) >= 3 and (" " + k + " ") in texte:
+                    cites.append(p)
+                    break
+        explicite = bool(cites)
+        if not explicite:  # le client n'a nommé personne : on ne devine que si l'article n'existe que chez un partenaire
+            if l["collecte_lieu"] or l["collecte_quartier"]:
+                return
+            ids = {a["partenaire_id"] for a, _ in trouves}
+            if len(ids) != 1:
+                return
+            cites = [p for p in parts if p["id"] in ids]
+        meilleur, score, egalite, lignes = None, -1, False, []
+        for p in cites:
+            mes = [(a, q) for a, q in trouves if a["partenaire_id"] == p["id"]]
+            if len(mes) > score:
+                meilleur, score, lignes, egalite = p, len(mes), mes, False
+            elif len(mes) == score:
+                egalite = True
+        if egalite and len(cites) > 1:
+            return  # plusieurs partenaires possibles : un humain tranchera
+        appliquer_partenaire(id, meilleur, lignes, ecraser_collecte=explicite)
+    except Exception:
+        log.exception("Reconnaissance du catalogue impossible")
+
+
+# ---------- confirmation au client : avec le détail des articles ----------
+MESSAGES_CLIENT["recu_attente"] = ("Bonjour{nom}, votre commande {numero} est bien reçue ✅ {articles}Livraison à : {lieu}. "
+                                   "Nous cherchons le livreur le plus proche et vous prévenons dès qu'il est en route. "
+                                   "Si quelque chose est faux, contactez-nous. - {entreprise}")
+
+
+def accuser_reception(id):
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+        deja = con.execute("SELECT 1 FROM messages_wa WHERE livraison_id=? AND type='recu_attente' AND sens='out'",
+                           (id,)).fetchone()
+        lignes = con.execute("SELECT nom, prix, quantite FROM lignes_commande WHERE livraison_id=?", (id,)).fetchall()
+    if not l or deja or not l["client_tel"]:
+        return
+    lieu = ", ".join(x for x in (l["livraison_adresse"], l["livraison_quartier"]) if x) or "à préciser"
+    articles = ""
+    if lignes:
+        articles = ("Articles : " + ", ".join(f"{r['quantite']} x {r['nom']}" for r in lignes)
+                    + f" ({fcfa(l['valeur_produit'])} F). ")
+    texte = texte_client("recu_attente", l, lieu=lieu, articles=articles)
+    envoyer(l["client_tel"], texte, modele=("WA_TEMPLATE_CLIENT", [texte], []), type_="recu_attente", livraison_id=id)
+
+
+from datetime import timedelta
+# ===================== V11 : rayons, promotions, avis, espace partenaire, revenus, nouveau design =====================
+# Quatre espaces, un seul circuit :
+#   - espace CLIENT      /boutique                 : rayons, partenaires, articles, commande par WhatsApp
+#   - espace PARTENAIRE  /espace                  : commandes, catalogue, promos, relevé
+#   - espace LIVREUR     /portail-livreur         : uniquement ses missions, contacts et statuts
+#   - espace ÉQUIPE      le reste de l'application : tout piloter, réservé au responsable
+# Réglages facultatifs en plus de V10 :
+#   URL_PUBLIQUE  : adresse publique de l'application pour ouvrir les comptes (ex : https://mon-nom.ngrok-free.dev)
+#   WA_AVIS_MIN   : minutes à attendre après la livraison avant de demander l'avis du client (10 par défaut)
+from markupsafe import Markup
+
+RAYONS_DEFAUT = [("Marché & fraîcheur", "🥬", "Fruits, légumes, viandes et poissons"),
+                 ("Restauration", "🍽️", "Plats, maquis et boissons"),
+                 ("Santé & pharmacie", "💊", "Médicaments et soins"),
+                 ("Boutiques & mode", "🛍️", "Vêtements, accessoires et maison"),
+                 ("Services & colis", "📦", "Courses, colis et démarches")]
+
+
+def migrer_v11(con):
+    con.executescript("""
+CREATE TABLE IF NOT EXISTS rayons (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, emoji TEXT DEFAULT '🛒',
+  description TEXT DEFAULT '', ordre INTEGER DEFAULT 0, actif INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS avis (id INTEGER PRIMARY KEY AUTOINCREMENT, livraison_id INTEGER UNIQUE, partenaire_id INTEGER DEFAULT 0,
+  livreur TEXT DEFAULT '', note INTEGER, cree_le TEXT);
+""")
+    ajouts = {"partenaires": [("rayon_id", "INTEGER DEFAULT 0"), ("token", "TEXT DEFAULT ''")],
+              "livreurs": [("token", "TEXT DEFAULT ''")],
+              "articles": [("rubrique", "TEXT DEFAULT ''"), ("promo_prix", "REAL DEFAULT 0"), ("promo_fin", "TEXT DEFAULT ''"),
+                           ("vedette", "INTEGER DEFAULT 0")],
+              "livraisons": [("prete_le", "TEXT DEFAULT ''"), ("avis_demande", "INTEGER DEFAULT 0")]}
+    for table, colonnes in ajouts.items():
+        existantes = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for col, typ in colonnes:
+            if col not in existantes:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+                if (table, col) == ("livraisons", "avis_demande"):
+                    con.execute("UPDATE livraisons SET avis_demande=1")  # pas de demande d'avis pour les anciennes livraisons
+    if not con.execute("SELECT 1 FROM rayons LIMIT 1").fetchone():
+        con.executemany("INSERT INTO rayons(nom, emoji, description, ordre) VALUES (?,?,?,?)",
+                        [(n, e, d, i) for i, (n, e, d) in enumerate(RAYONS_DEFAUT)])
+    for r in con.execute("SELECT id FROM partenaires WHERE COALESCE(token,'')=''").fetchall():
+        con.execute("UPDATE partenaires SET token=? WHERE id=?", (secrets.token_urlsafe(16), r["id"]))
+    for r in con.execute("SELECT id FROM livreurs WHERE COALESCE(token,'')=''").fetchall():
+        con.execute("UPDATE livreurs SET token=? WHERE id=?", (secrets.token_urlsafe(24), r["id"]))
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_livreurs_token ON livreurs(token)")
+
+
+_init_db_v10 = init_db
+
+
+def init_db():
+    _init_db_v10()
+    with db() as con:
+        migrer_v11(con)
+
+
+def migrer_v12(con):
+    con.execute("""CREATE TABLE IF NOT EXISTS comptes_portail (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL CHECK(role IN ('livreur','partenaire')),
+        profil_id INTEGER NOT NULL,
+        identifiant TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        mot_de_passe_hash TEXT NOT NULL,
+        version_session INTEGER NOT NULL DEFAULT 1,
+        cree_le TEXT NOT NULL,
+        modifie_le TEXT NOT NULL,
+        UNIQUE(role, profil_id))""")
+    colonnes = {r[1] for r in con.execute("PRAGMA table_info(comptes_portail)")}
+    if "version_session" not in colonnes:
+        con.execute("ALTER TABLE comptes_portail ADD COLUMN version_session INTEGER NOT NULL DEFAULT 1")
+
+
+_init_db_v11 = init_db
+
+
+def init_db():
+    _init_db_v11()
+    with db() as con:
+        migrer_v12(con)
+
+
+def migrer_v13(con):
+    colonnes = {r[1] for r in con.execute("PRAGMA table_info(livraisons)")}
+    for col, typ in (("paiement_recu_par", "TEXT DEFAULT ''"),
+                     ("montant_encaisse_livreur", "INTEGER DEFAULT 0")):
+        if col not in colonnes:
+            con.execute(f"ALTER TABLE livraisons ADD COLUMN {col} {typ}")
+    con.execute("""CREATE TABLE IF NOT EXISTS remises_livreurs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        livraison_id INTEGER NOT NULL UNIQUE,
+        livreur_nom TEXT NOT NULL,
+        montant INTEGER NOT NULL CHECK(montant > 0),
+        moyen TEXT NOT NULL,
+        date_operation TEXT NOT NULL,
+        note TEXT DEFAULT '',
+        cree_le TEXT NOT NULL
+    )""")
+
+
+_init_db_v12 = init_db
+
+
+def init_db():
+    _init_db_v12()
+    with db() as con:
+        migrer_v13(con)
+
+
+def migrer_v14(con):
+    colonnes = {r[1] for r in con.execute("PRAGMA table_info(livraisons)")}
+    if "encaisse_course_prevu" not in colonnes:
+        con.execute("ALTER TABLE livraisons ADD COLUMN encaisse_course_prevu TEXT DEFAULT 'À préciser'")
+    con.execute("UPDATE livraisons SET encaisse_course_prevu='À préciser' "
+                "WHERE COALESCE(encaisse_course_prevu,'') NOT IN ('À préciser','Livreur','Notre équipe')")
+
+
+_init_db_v13 = init_db
+
+
+def configurer_sqlite():
+    """Active WAL et des index adaptés aux recherches courantes, sans toucher aux lignes existantes."""
+    con = sqlite3.connect(DB, timeout=30)
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.executescript("""
+CREATE INDEX IF NOT EXISTS idx_livraisons_statut_id
+    ON livraisons(statut, id DESC);
+CREATE INDEX IF NOT EXISTS idx_livraisons_paiement_statut_id
+    ON livraisons(statut_paiement, statut, id DESC);
+CREATE INDEX IF NOT EXISTS idx_livraisons_livreur_statut_id
+    ON livraisons(livreur, statut, id DESC);
+CREATE INDEX IF NOT EXISTS idx_livraisons_client_tel_id
+    ON livraisons(client_tel, id DESC);
+CREATE INDEX IF NOT EXISTS idx_livraisons_date_creation
+    ON livraisons(date(cree_le));
+CREATE INDEX IF NOT EXISTS idx_livraisons_partenaire_statut_id
+    ON livraisons(partenaire_id, statut, id DESC);
+CREATE INDEX IF NOT EXISTS idx_livraisons_dashboard_suivi
+    ON livraisons(id DESC)
+    WHERE statut IN ('en attente','collecté') OR (statut='livré' AND statut_paiement!='payé');
+CREATE INDEX IF NOT EXISTS idx_livraisons_dashboard_impayes
+    ON livraisons(COALESCE(NULLIF(heure_livraison,''),cree_le), id)
+    WHERE statut='livré' AND statut_paiement!='payé';
+CREATE INDEX IF NOT EXISTS idx_livraisons_dashboard_alertes
+    ON livraisons(id DESC)
+    WHERE auto_etat IN ('a_verifier','erreur_envoi','a_completer');
+CREATE INDEX IF NOT EXISTS idx_messages_wa_livraison_type_sens
+    ON messages_wa(livraison_id, type, sens);
+CREATE INDEX IF NOT EXISTS idx_lignes_commande_livraison
+    ON lignes_commande(livraison_id);
+CREATE INDEX IF NOT EXISTS idx_articles_partenaire_dispo
+    ON articles(partenaire_id, dispo);
+CREATE INDEX IF NOT EXISTS idx_versements_partenaire_id
+    ON versements(partenaire_id, id DESC);
+""")
+    finally:
+        con.close()
+
+
+def init_db():
+    _init_db_v13()
+    with db() as con:
+        migrer_v14(con)
+    configurer_sqlite()
+
+
+# ---------- promotions, notes, rayons : petites aides utilisables aussi dans les pages ----------
+def promo_active(a):
+    p = a["promo_prix"] or 0
+    return bool(p > 0 and p < (a["prix"] or 0) and (not a["promo_fin"] or a["promo_fin"] >= datetime.now().strftime("%Y-%m-%d")))
+
+
+def prix_effectif(a):
+    return a["promo_prix"] if promo_active(a) else a["prix"]
+
+
+def pct_promo(a):
+    return round(100 * (1 - a["promo_prix"] / a["prix"])) if promo_active(a) and a["prix"] else 0
+
+
+def note_partenaire(pid):
+    """(moyenne, nombre d'avis) ; la moyenne reste None tant qu'il y a moins de 3 avis."""
+    with db() as con:
+        r = con.execute("SELECT AVG(note) m, COUNT(*) n FROM avis WHERE partenaire_id=?", (pid,)).fetchone()
+    return (round(r["m"], 1) if r["n"] >= 3 else None), r["n"]
+
+
+def liste_rayons(tous=False):
+    with db() as con:
+        return con.execute("SELECT * FROM rayons " + ("" if tous else "WHERE actif=1 ") + "ORDER BY ordre, id").fetchall()
+
+
+def rubriques_partenaire(pid):
+    with db() as con:
+        return [r[0] for r in con.execute("SELECT DISTINCT rubrique FROM articles WHERE partenaire_id=? AND rubrique!='' ORDER BY rubrique", (pid,))]
+
+
+def lien_connexion():
+    base = os.environ.get("URL_PUBLIQUE", "").rstrip("/") or request.url_root.rstrip("/")
+    return f"{base}/connexion"
+
+
+def identifiant_compte_portail(role, profil_id):
+    with db() as con:
+        compte = con.execute("SELECT identifiant FROM comptes_portail WHERE role=? AND profil_id=?",
+                             (role, profil_id)).fetchone()
+    return compte["identifiant"] if compte else ""
+
+
+def initiale(nom):
+    return (nom or "?").strip()[:1].upper()
+
+
+app.jinja_env.globals.update(promo_active=promo_active, prix_effectif=prix_effectif, pct_promo=pct_promo, note_partenaire=note_partenaire,
+                             liste_rayons=liste_rayons, rubriques_partenaire=rubriques_partenaire,
+                             lien_connexion=lien_connexion, csrf_portail=csrf_portail, initiale=initiale)
+
+
+# ---------- rayons (administration) ----------
+PAGE_RAYONS = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="entete"><div><h1>🗂️ Rayons</h1><p>Les grandes sections de la boutique. Le client choisit un rayon, puis un partenaire, puis ses articles.
+Un rayon sans partenaire n'apparaît pas pour les clients.</p></div></div>
+{% if msg %}<div class="card"><b>{{ msg }}</b></div>{% endif %}
+<div class="card"><h2>Les rayons</h2>
+{% for r in rayons %}<div style="padding:12px 0;border-top:1px solid var(--bord)">
+<form method="post" action="{{ url_for('modifier_rayon', id=r.id) }}" style="display:grid;grid-template-columns:70px 1.2fr 2fr 80px auto;gap:10px;align-items:end">
+<div><label>Icône</label><input name="emoji" value="{{ r.emoji }}" maxlength="4"></div>
+<div><label>Nom</label><input name="nom" value="{{ r.nom }}" required></div>
+<div><label>Description (visible par les clients)</label><input name="description" value="{{ r.description }}"></div>
+<div><label>Ordre</label><input type="number" name="ordre" value="{{ r.ordre }}"></div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><label style="margin:0;display:flex;gap:6px;align-items:center"><input type="checkbox" name="actif" value="1" {{ 'checked' if r.actif }}>visible</label>
+<button>Enregistrer</button></div></form>
+<div class="mut" style="margin-top:6px">{{ r.n }} partenaire{{ 's' if r.n > 1 }} dans ce rayon
+<form method="post" action="{{ url_for('supprimer_rayon', id=r.id) }}" class="inline" onsubmit="return confirm('Supprimer ce rayon ?')"> · <button class="danger" style="padding:2px 10px">Supprimer</button></form></div></div>
+{% endfor %}</div>
+<form method="post" class="card"><h2>Ajouter un rayon</h2>
+<div class="grille"><div><label>Nom</label><input name="nom" required placeholder="ex : Boulangerie"></div>
+<div><label>Icône (un emoji)</label><input name="emoji" value="🛒" maxlength="4"></div>
+<div><label>Description</label><input name="description"></div></div><p><button>Ajouter</button></p></form>
+<style>@media(max-width:900px){form[action*="/rayons/"]{grid-template-columns:1fr!important}}</style>
+""")
+
+
+@app.route("/rayons", methods=["GET", "POST"], endpoint="rayons")
+def rayons_admin():
+    if request.method == "POST":
+        nom = request.form.get("nom", "").strip()
+        if not nom:
+            return redirect(url_for("rayons", msg="Le nom du rayon est obligatoire."))
+        try:
+            with db() as con:
+                ordre = con.execute("SELECT COALESCE(MAX(ordre),0)+1 FROM rayons").fetchone()[0]
+                con.execute("INSERT INTO rayons(nom, emoji, description, ordre) VALUES (?,?,?,?)",
+                            (nom, request.form.get("emoji", "").strip() or "🛒", request.form.get("description", "").strip()[:120], ordre))
+            return redirect(url_for("rayons", msg=f"Rayon « {nom} » ajouté."))
+        except sqlite3.IntegrityError:
+            return redirect(url_for("rayons", msg="Un rayon porte déjà ce nom."))
+    with db() as con:
+        lignes = con.execute("SELECT r.*, (SELECT COUNT(*) FROM partenaires p WHERE p.rayon_id=r.id) n FROM rayons r ORDER BY ordre, id").fetchall()
+    return render_template_string(PAGE_RAYONS, rayons=lignes, msg=request.args.get("msg", ""))
+
+
+@app.route("/rayons/<int:id>/modifier", methods=["POST"])
+def modifier_rayon(id):
+    f = request.form
+    nom = f.get("nom", "").strip()
+    if not nom:
+        return redirect(url_for("rayons", msg="Le nom du rayon est obligatoire."))
+    try:
+        with db() as con:
+            con.execute("UPDATE rayons SET nom=?, emoji=?, description=?, ordre=?, actif=? WHERE id=?",
+                        (nom, f.get("emoji", "").strip() or "🛒", f.get("description", "").strip()[:120],
+                         int(nombre(f.get("ordre", "")) or 0), 1 if f.get("actif") else 0, id))
+        return redirect(url_for("rayons", msg="Rayon enregistré."))
+    except sqlite3.IntegrityError:
+        return redirect(url_for("rayons", msg="Un autre rayon porte déjà ce nom."))
+
+
+@app.route("/rayons/<int:id>/supprimer", methods=["POST"])
+def supprimer_rayon(id):
+    with db() as con:
+        n = con.execute("SELECT COUNT(*) FROM partenaires WHERE rayon_id=?", (id,)).fetchone()[0]
+        if not n:
+            con.execute("DELETE FROM rayons WHERE id=?", (id,))
+    return redirect(url_for("rayons", msg="Rayon supprimé." if not n else "Impossible : des partenaires sont dans ce rayon. Déplace-les d'abord."))
+
+
+# ---------- avis des clients ----------
+def verifier_avis():
+    """Quelques minutes après une livraison WhatsApp, demande au client ce qu'il en a pensé (3 boutons)."""
+    if not wa_configure() or os.environ.get("WA_MODE", "auto").lower() == "manuel":
+        return
+    delai = int(os.environ.get("WA_AVIS_MIN", "10") or 10)
+    trop_tot = (datetime.now() - timedelta(minutes=delai)).strftime("%Y-%m-%d %H:%M")
+    trop_tard = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M")
+    with db() as con:
+        lignes = con.execute(
+            "SELECT * FROM livraisons WHERE statut='livré' AND canal='WhatsApp' AND COALESCE(avis_demande,0)=0 "
+            "AND COALESCE(client_tel,'')!='' AND COALESCE(message_original,'') NOT LIKE '[TEST]%' "
+            "AND COALESCE(NULLIF(heure_livraison,''), cree_le) <= ? AND COALESCE(NULLIF(heure_livraison,''), cree_le) >= ?",
+            (trop_tot, trop_tard)).fetchall()
+    ent = nom_entreprise()
+    for l in lignes:
+        with db() as con:
+            con.execute("UPDATE livraisons SET avis_demande=1 WHERE id=?", (l["id"],))
+        prenom = (l["client_nom"] or "").split()[0] if (l["client_nom"] or "").strip() else ""
+        texte = (f"Merci{' ' + prenom if prenom else ''} pour votre confiance ! Comment s'est passée votre livraison {l['numero']} ? "
+                 f"Votre avis nous aide à nous améliorer. - {ent}")
+        b = [(f"avis:{l['id']}:5", "😍 Super"), (f"avis:{l['id']}:3", "🙂 Correct"), (f"avis:{l['id']}:1", "😕 Pas bien")]
+        try:
+            envoyer(l["client_tel"], texte, b, ("WA_TEMPLATE_CLIENT", [texte], [x[0] for x in b]), "avis_demande", l["id"])
+        except Exception:
+            log.exception("Demande d'avis impossible pour %s", l["numero"])
+
+
+def traiter_avis(tel, bouton):
+    _, id, note = bouton.split(":")
+    id, note = int(id), int(note)
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+    if not l or tel_wa(l["client_tel"]) != tel_wa(tel) or note not in (1, 3, 5):
+        return
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO avis(livraison_id, partenaire_id, livreur, note, cree_le) VALUES (?,?,?,?,?)",
+                    (id, l["partenaire_id"] or 0, l["livreur"] or "", note, maintenant()))
+    ent = nom_entreprise()
+    if note >= 5:
+        retour = f"Merci beaucoup, ça nous fait très plaisir ! 🙏 À bientôt. - {ent}"
+    elif note == 3:
+        retour = f"Merci pour votre retour, nous allons faire encore mieux. - {ent}"
+    else:
+        retour = f"Nous sommes désolés que cela ne se soit pas bien passé. Nous allons vous contacter pour arranger les choses. - {ent}"
+        qui = f"{l['client_nom'] or l['client_tel']}"
+        alerter_equipe(f"😕 Avis négatif sur {l['numero']} (livreur : {l['livreur'] or '-'}) : appeler {qui}", id)
+    envoyer(tel, retour, type_="avis_retour", livraison_id=id)
+
+
+_traiter_message_v10 = traiter_message
+
+
+def traiter_message(msg):
+    b = msg.get("bouton") or ""
+    if b.startswith("avis:"):
+        tel = chiffres(msg["from"])
+        with db() as con:
+            if msg["id"] and con.execute("SELECT 1 FROM messages_wa WHERE id=?", (msg["id"],)).fetchone():
+                return
+        journaliser_wa(msg["id"], "in", tel, "avis", msg.get("texte") or b)
+        try:
+            traiter_avis(tel, b)
+        except Exception:
+            log.exception("Avis non traité")
+        return
+    return _traiter_message_v10(msg)
+
+
+_verifier_relances_v9 = verifier_relances
+
+
+def verifier_relances():
+    _verifier_relances_v9()
+    verifier_avis()
+
+
+# ---------- pages d'administration : partenaires ----------
+def _lire_partenaire(f):
+    pct = nombre(f.get("commission_pct", ""))
+    rid = f.get("rayon_id", "")
+    return {"nom": f.get("nom", "").strip(), "categorie": f.get("categorie", "").strip(), "tel": chiffres(f.get("tel", "")),
+            "adresse": f.get("adresse", "").strip(), "quartier": f.get("quartier", "").strip(),
+            "alias": ", ".join(x.strip() for x in f.get("alias", "").split(",") if x.strip()),
+            "description": f.get("description", "").strip()[:300], "rayon_id": int(rid) if rid.isdigit() else 0,
+            "commission_pct": min(max(float(pct if pct is not None else TAUX_DEFAUT), 0), 100),
+            "frais_fixe": max(float(nombre(f.get("frais_fixe", "")) or 0), 0),
+            "course_defaut": max(float(nombre(f.get("course_defaut", "")) or 0), 0),
+            "encaisse_par": "partenaire" if f.get("encaisse_par") == "partenaire" else "nous"}
+
+
+FORM_PARTENAIRE = """
+<div class="grille">
+<div><label>Nom du partenaire</label><input name="nom" value="{{ p.nom if p else '' }}" required></div>
+<div><label>Rayon (section de la boutique)</label><select name="rayon_id"><option value="0">Autres partenaires</option>
+{% for r in liste_rayons(True) %}<option value="{{ r.id }}" {{ 'selected' if p and p.rayon_id == r.id }}>{{ r.emoji }} {{ r.nom }}</option>{% endfor %}</select></div>
+<div><label>Type de commerce (texte libre)</label><input name="categorie" value="{{ p.categorie if p else '' }}" placeholder="ex : Maquis, Pharmacie, Boucherie"></div>
+<div><label>WhatsApp du partenaire</label><input name="tel" value="{{ p.tel if p else '' }}" placeholder="70 12 34 56"></div>
+<div><label>Quartier</label><input name="quartier" value="{{ p.quartier if p else '' }}" placeholder="ex : Tanghin"></div>
+<div><label>Adresse / repère</label><input name="adresse" value="{{ p.adresse if p else '' }}"></div>
+<div><label>Autres noms que les clients utilisent (séparés par des virgules)</label><input name="alias" value="{{ p.alias if p else '' }}"></div>
+<div><label>Ta commission (% des articles vendus)</label><input name="commission_pct" value="{{ '%g'|format(p.commission_pct) if p else 10 }}"></div>
+<div><label>Frais fixe par commande livrée (FCFA)</label><input name="frais_fixe" value="{{ p.frais_fixe|int if p else 0 }}"></div>
+<div><label>Prix de course par défaut (FCFA)</label><input name="course_defaut" value="{{ p.course_defaut|int if p else 0 }}"></div>
+<div><label>Qui encaisse l'argent des articles ?</label><select name="encaisse_par">
+<option value="nous" {{ 'selected' if not p or p.encaisse_par != 'partenaire' }}>Nous (on lui reverse sa part)</option>
+<option value="partenaire" {{ 'selected' if p and p.encaisse_par == 'partenaire' }}>Le partenaire (il nous doit la commission)</option></select></div>
+</div>
+<label>Description courte pour la boutique</label><input name="description" value="{{ p.description if p else '' }}" maxlength="300">
+"""
+
+PAGE_PARTENAIRES = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="entete"><div><h1>🏪 Partenaires</h1><p>Les commerces dont on livre les articles. Chaque vente livrée te rapporte une commission.</p></div>
+<div class="actions"><a class="btn" href="{{ url_for('commande_catalogue') }}">🛒 Prendre une commande</a>
+<a class="btn sec" href="{{ url_for('rayons') }}">🗂️ Rayons</a><a class="btn sec" href="{{ url_for('boutique') }}" target="_blank">🛍️ Boutique</a></div></div>
+{% if msg %}<div class="card"><b>{{ msg }}</b></div>{% endif %}
+<div class="stats" style="margin-bottom:18px">
+<div class="stat"><b>{{ nb_actifs }}</b><span>partenaires actifs</span></div>
+<div class="stat ambre"><b>{{ com_mois|fcfa }} F</b><span>ta commission ce mois</span></div>
+<div class="stat"><b>{{ ventes_mois|fcfa }} F</b><span>articles vendus ce mois</span></div></div>
+<style>.pg{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;margin-bottom:18px}
+.pc{background:var(--card);border:1px solid var(--bord);border-radius:var(--r);padding:16px;box-shadow:var(--ombre);display:flex;flex-direction:column;gap:10px}
+.pc .t{display:flex;gap:12px;align-items:center}.av{width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,var(--vert2),var(--vert));color:#fff;display:grid;place-items:center;font-weight:800;font-size:1.2rem;flex:none;overflow:hidden}
+.av img{width:100%;height:100%;object-fit:cover}.pc b{display:block}.pc .n{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center}
+.pc .n div{background:var(--soft);border-radius:10px;padding:8px 4px}.pc .n strong{display:block;font-size:1rem}.pc .n span{font-size:.7rem;color:var(--mut)}.pc a.btn{margin-top:auto}</style>
+<div class="pg">{% for r in lignes %}<div class="pc"><div class="t"><div class="av">{% if r.p.photo %}<img src="{{ url_for('photo', nom=r.p.photo) }}" alt="">{% else %}{{ initiale(r.p.nom) }}{% endif %}</div>
+<div><b>{{ r.p.nom }}</b><span class="mut">{{ r.rayon_nom }}{% if r.p.quartier %} · {{ r.p.quartier }}{% endif %}</span></div></div>
+<div>{% if not r.p.actif %}<span class="pastille rouge">inactif</span> {% endif %}{% if r.note %}<span class="pastille ambre">★ {{ r.note }} ({{ r.nb_avis }})</span> {% endif %}<span class="pastille">{{ r.n_articles }} article{{ 's' if r.n_articles > 1 }}</span>
+{% if r.b.encours %}<span class="pastille ambre">{{ r.b.encours }} en cours</span>{% endif %}</div>
+<div class="n"><div><strong>{{ r.tous.nb }}</strong><span>livrées</span></div><div><strong>{{ r.tous.ventes|fcfa }}</strong><span>ventes F</span></div><div><strong>{{ r.tous.commission|fcfa }}</strong><span>commission F</span></div></div>
+<div class="mut">{% if r.b.solde > 0 %}💸 On lui doit {{ r.b.solde|fcfa }} F{% elif r.b.solde < 0 %}💰 Il nous doit {{ (-r.b.solde)|fcfa }} F{% else %}✅ Comptes à jour{% endif %}</div>
+<a class="btn sec" href="{{ url_for('partenaire', id=r.p.id) }}" style="justify-content:center">Ouvrir la fiche</a></div>
+{% else %}<div class="card vide" style="grid-column:1/-1">Aucun partenaire pour le moment. Ajoute le premier ci-dessous.</div>{% endfor %}</div>
+<form method="post" class="card"><h2>Ajouter un partenaire</h2>""" + FORM_PARTENAIRE + """<p><button>Ajouter</button></p></form>
+""")
+
+
+def _bilan_complet(pid):
+    return bilan_partenaire(pid, datetime.now().strftime("%Y-%m")), bilan_partenaire(pid)
+
+
+@app.route("/partenaires", methods=["GET", "POST"])
+def partenaires():
+    if request.method == "POST":
+        d = _lire_partenaire(request.form)
+        if not d["nom"]:
+            return redirect(url_for("partenaires", msg="Le nom du partenaire est obligatoire."))
+        try:
+            with db() as con:
+                cur = con.execute(
+                    "INSERT INTO partenaires(nom, categorie, tel, adresse, quartier, alias, description, rayon_id, commission_pct, frais_fixe, "
+                    "course_defaut, encaisse_par, token, actif, cree_le) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)",
+                    (d["nom"], d["categorie"], d["tel"], d["adresse"], d["quartier"], d["alias"], d["description"], d["rayon_id"],
+                     d["commission_pct"], d["frais_fixe"], d["course_defaut"], d["encaisse_par"], secrets.token_urlsafe(16), maintenant()))
+            return redirect(url_for("partenaire", id=cur.lastrowid))
+        except sqlite3.IntegrityError:
+            return redirect(url_for("partenaires", msg="Un partenaire porte déjà ce nom."))
+    with db() as con:
+        parts = con.execute("SELECT * FROM partenaires ORDER BY actif DESC, nom").fetchall()
+        n_art = {r[0]: r[1] for r in con.execute("SELECT partenaire_id, COUNT(*) FROM articles GROUP BY partenaire_id")}
+        noms_rayons = {r["id"]: f"{r['emoji']} {r['nom']}" for r in con.execute("SELECT * FROM rayons")}
+    lignes, com_mois, ventes_mois = [], 0, 0
+    for p in parts:
+        b, t = _bilan_complet(p["id"])
+        com_mois += b["commission"]
+        ventes_mois += b["ventes"]
+        note, nb = note_partenaire(p["id"])
+        lignes.append({"p": p, "b": t, "tous": t, "n_articles": n_art.get(p["id"], 0), "note": note, "nb_avis": nb,
+                       "rayon_nom": noms_rayons.get(p["rayon_id"], "Autres partenaires")})
+    return render_template_string(PAGE_PARTENAIRES, lignes=lignes, msg=request.args.get("msg", ""), com_mois=com_mois,
+                                  ventes_mois=ventes_mois, nb_actifs=sum(1 for p in parts if p["actif"]))
+
+
+PAGE_PARTENAIRE = BASE.replace("{% block corps %}{% endblock %}", """
+<style>.av{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,var(--vert2),var(--vert));color:#fff;display:grid;place-items:center;font-weight:800;font-size:1.4rem;flex:none;overflow:hidden}
+.av img{width:100%;height:100%;object-fit:cover}.art{display:grid;grid-template-columns:72px 1fr;gap:14px;padding:14px 0;border-top:1px solid var(--bord)}
+.art .ph{width:72px;height:72px;border-radius:12px;background:var(--soft);overflow:hidden;display:grid;place-items:center;font-size:1.6rem}.art .ph img{width:100%;height:100%;object-fit:cover}
+.rub{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);font-weight:700;margin:18px 0 -4px}
+.lien-esp{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.lien-esp input{flex:1;min-width:240px}
+@media(max-width:600px){.art{grid-template-columns:1fr}}</style>
+<div class="entete"><div style="display:flex;gap:14px;align-items:center"><div class="av">{% if p.photo %}<img src="{{ url_for('photo', nom=p.photo) }}" alt="">{% else %}{{ initiale(p.nom) }}{% endif %}</div>
+<div><h1>{{ p.nom }}</h1><p>{{ p.categorie }}{% if p.quartier %} · {{ p.quartier }}{% endif %}
+{% if not p.actif %} <span class="pastille rouge">inactif</span>{% endif %}{% if note %} <span class="pastille ambre">★ {{ note }} ({{ nb_avis }} avis)</span>{% endif %}</p></div></div>
+<div class="actions"><a class="btn" href="{{ url_for('commande_catalogue', p=p.id) }}">🛒 Prendre une commande</a>
+<a class="btn sec" href="{{ url_for('releve', id=p.id) }}">📄 Relevé</a>
+<a class="btn sec" href="{{ url_for('boutique_partenaire', id=p.id) }}" target="_blank">👁️ Boutique</a>
+<a class="btn sec" href="{{ url_for('partenaires') }}">← Partenaires</a></div></div>
+{% if msg %}<div class="card"><b>{{ msg }}</b></div>{% endif %}
+<div class="stats" style="margin-bottom:18px">
+<div class="stat ambre"><b>{{ mois.commission|fcfa }} F</b><span>ta commission ce mois</span></div>
+<div class="stat"><b>{{ mois.ventes|fcfa }} F</b><span>articles vendus ce mois ({{ mois.nb }} livrées)</span></div>
+<div class="stat {{ 'rouge' if tout.solde < 0 }}"><b>{{ (tout.solde if tout.solde >= 0 else -tout.solde)|fcfa }} F</b>
+<span>{% if tout.solde > 0 %}on lui doit{% elif tout.solde < 0 %}il nous doit{% else %}solde à jour{% endif %}</span></div>
+<div class="stat"><b>{{ tout.encours }}</b><span>commande{{ 's' if tout.encours > 1 }} en cours</span></div></div>
+
+<div class="card"><h2>🔐 Compte privé du partenaire</h2>
+<p class="mut">Le partenaire se connecte avec un identifiant et un mot de passe. Son espace reste limité à ses commandes, son catalogue, son relevé et son profil.</p>
+<p><b>Identifiant actuel :</b> {{ identifiant_compte or 'Aucun compte configuré' }}</p>
+<form method="post" action="{{ url_for('compte_partenaire_admin', id=p.id) }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><div class="grille"><label>Identifiant de connexion<input name="identifiant" value="{{ identifiant_compte or ('partenaire' ~ p.id) }}" minlength="3" maxlength="40" pattern="[A-Za-z0-9._-]+" required></label><label>Mot de passe initial ou nouveau (12 à 256 caractères)<input type="password" name="mot_de_passe" minlength="12" maxlength="256" autocomplete="new-password" required></label><label>Confirmer le mot de passe<input type="password" name="confirmation" minlength="12" maxlength="256" autocomplete="new-password" required></label></div><p><button>Créer ou réinitialiser le compte</button></p></form>
+<p class="mut">Après validation, transmets l’identifiant et le mot de passe au partenaire par un canal privé. Adresse de connexion :</p><input readonly value="{{ lien_connexion() }}" onclick="this.select()">
+{% if not url_publique %}<p class="mut">Pour une connexion depuis l’extérieur, définis <code>URL_PUBLIQUE</code> et <code>BOUTIQUE_PUBLIQUE=1</code>.</p>{% endif %}</div>
+
+<form method="post" action="{{ url_for('modifier_partenaire', id=p.id) }}" enctype="multipart/form-data" class="card"><h2>Informations et conditions</h2>""" + FORM_PARTENAIRE + """
+<div class="grille"><div><label>Photo du partenaire (facultatif)</label><input type="file" name="photo" accept="image/*"></div></div>
+<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" name="actif" value="1" {{ 'checked' if p.actif }}> partenaire actif (visible dans la boutique)</label>
+<p><button>Enregistrer</button></p></form>
+
+<div class="card"><h2>📦 Catalogue ({{ articles|length }} article{{ 's' if articles|length > 1 }})</h2>
+<p class="mut">Regroupe les articles par rubrique (Plats, Boissons, Fruits...) : le client les voit classés. Une promotion s'arrête toute seule à sa date de fin.</p>
+<datalist id="rubs">{% for r in rubriques_partenaire(p.id) %}<option value="{{ r }}">{% endfor %}</datalist>
+{% for rub, liste in articles|groupby('rubrique') %}<div class="rub">{{ rub or 'Sans rubrique' }}</div>
+{% for a in liste %}<div class="art"><div class="ph">{% if a.photo %}<img src="{{ url_for('photo', nom=a.photo) }}" alt="">{% else %}🍽️{% endif %}</div>
+<div><form method="post" action="{{ url_for('modifier_article', aid=a.id) }}" enctype="multipart/form-data">
+<div class="grille"><div><label>Article</label><input name="nom" value="{{ a.nom }}" required></div>
+<div><label>Prix (FCFA)</label><input name="prix" value="{{ a.prix|int }}" required></div>
+<div><label>Rubrique</label><input name="rubrique" value="{{ a.rubrique }}" list="rubs"></div>
+<div><label>Description</label><input name="description" value="{{ a.description }}"></div>
+<div><label>Prix promo (FCFA, facultatif)</label><input name="promo_prix" value="{{ a.promo_prix|int if a.promo_prix else '' }}"></div>
+<div><label>Fin de la promo</label><input type="date" name="promo_fin" value="{{ a.promo_fin }}"></div>
+<div><label>Photo</label><input type="file" name="photo" accept="image/*"></div></div>
+<div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:10px">
+<label style="margin:0;display:flex;gap:6px;align-items:center"><input type="checkbox" name="dispo" value="1" {{ 'checked' if a.dispo }}> disponible</label>
+<label style="margin:0;display:flex;gap:6px;align-items:center"><input type="checkbox" name="vedette" value="1" {{ 'checked' if a.vedette }}> ⭐ mis en avant</label>
+{% if promo_active(a) %}<span class="pastille ambre">promo −{{ pct_promo(a) }} %</span>{% endif %}
+<button>Enregistrer</button></div></form>
+<form method="post" action="{{ url_for('supprimer_article', aid=a.id) }}" class="inline" onsubmit="return confirm('Supprimer cet article ?')"><button class="danger" style="padding:3px 12px;margin-top:8px">Supprimer</button></form></div></div>{% endfor %}
+{% else %}<p class="vide">Aucun article. Ajoute le premier ci-dessous.</p>{% endfor %}</div>
+
+<form method="post" action="{{ url_for('ajouter_article', id=p.id) }}" enctype="multipart/form-data" class="card"><h2>Ajouter un article</h2><div class="grille">
+<div><label>Article</label><input name="nom" required placeholder="ex : Poulet braisé"></div>
+<div><label>Prix (FCFA)</label><input name="prix" required></div>
+<div><label>Rubrique</label><input name="rubrique" list="rubs" placeholder="ex : Plats"></div>
+<div><label>Description (facultatif)</label><input name="description"></div>
+<div><label>Photo (facultatif)</label><input type="file" name="photo" accept="image/*"></div></div>
+<p><button>Ajouter</button></p></form>
+
+<div class="card"><h2>💰 Versements</h2>
+<p class="mut">Note ici chaque paiement entre toi et le partenaire pour que le solde reste juste.</p>
+<form method="post" action="{{ url_for('versement', id=p.id) }}" class="grille">
+<div><label>Sens</label><select name="sens"><option value="aux_partenaire">Je lui ai payé sa part</option><option value="du_partenaire">Il m'a payé ma commission</option></select></div>
+<div><label>Montant (FCFA)</label><input name="montant" required></div>
+<div><label>Moyen</label><select name="moyen"><option>Espèces</option><option>Orange Money</option><option>Moov Money</option><option>Mobi Cash</option><option>Autre</option></select></div>
+<div><label>Note (facultatif)</label><input name="note" placeholder="ex : règlement de la semaine"></div>
+<div style="align-self:end"><button>Enregistrer</button></div></form>
+{% for v in tout.versements %}<div class="ligne"><span>{{ v.cree_le }} · {{ 'Payé au partenaire' if v.sens == 'aux_partenaire' else 'Reçu du partenaire' }} {{ v.note }}</span><b>{{ v.montant|fcfa }} F</b></div>{% endfor %}</div>
+{{ script_photos|safe }}
+""")
+
+SCRIPT_PHOTOS = Markup("""<script>
+document.addEventListener('submit', async function (ev) {
+  const f = ev.target, inp = f.querySelector('input[type=file]');
+  if (!inp || !inp.files.length || f.dataset.redim) return;
+  const file = inp.files[0];
+  if (!file.type.startsWith('image/') || file.size < 300000) return;
+  ev.preventDefault();
+  try {
+    const bmp = await createImageBitmap(file), s = Math.min(1, 900 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas'); c.width = Math.round(bmp.width * s); c.height = Math.round(bmp.height * s);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.82));
+    const dt = new DataTransfer(); dt.items.add(new File([blob], 'photo.jpg', {type: 'image/jpeg'})); inp.files = dt.files;
+  } catch (e) {}
+  f.dataset.redim = '1'; f.submit();
+});
+</script>""")
+app.jinja_env.globals.update(script_photos=SCRIPT_PHOTOS, tel_wa=tel_wa)
+
+
+@app.route("/partenaires/<int:id>")
+def partenaire(id):
+    with db() as con:
+        p = con.execute("SELECT * FROM partenaires WHERE id=?", (id,)).fetchone()
+        articles = con.execute("SELECT * FROM articles WHERE partenaire_id=? ORDER BY rubrique, dispo DESC, nom", (id,)).fetchall()
+    if not p:
+        return redirect(url_for("partenaires"))
+    mois, tout = _bilan_complet(id)
+    note, nb = note_partenaire(id)
+    return render_template_string(PAGE_PARTENAIRE, p=p, articles=articles, mois=mois, tout=tout, msg=request.args.get("msg", ""),
+                                  note=note, nb_avis=nb, url_publique=bool(os.environ.get("URL_PUBLIQUE")),
+                                  identifiant_compte=identifiant_compte_portail("partenaire", id))
+
+
+@app.route("/partenaires/<int:id>/modifier", methods=["POST"])
+def modifier_partenaire(id):
+    d = _lire_partenaire(request.form)
+    if not d["nom"]:
+        return redirect(url_for("partenaire", id=id, msg="Le nom du partenaire est obligatoire."))
+    with db() as con:
+        ancien = con.execute("SELECT photo FROM partenaires WHERE id=?", (id,)).fetchone()
+    try:
+        ph = enregistrer_photo(request.files.get("photo"))
+    except ValueError as e:
+        return redirect(url_for("partenaire", id=id, msg=str(e)))
+    try:
+        with db() as con:
+            con.execute("UPDATE partenaires SET nom=?, categorie=?, tel=?, adresse=?, quartier=?, alias=?, description=?, rayon_id=?, "
+                        "commission_pct=?, frais_fixe=?, course_defaut=?, encaisse_par=?, actif=?, photo=COALESCE(NULLIF(?,''), photo) WHERE id=?",
+                        (d["nom"], d["categorie"], d["tel"], d["adresse"], d["quartier"], d["alias"], d["description"], d["rayon_id"],
+                         d["commission_pct"], d["frais_fixe"], d["course_defaut"], d["encaisse_par"],
+                         1 if request.form.get("actif") else 0, ph, id))
+        if ph and ancien:
+            supprimer_photo(ancien["photo"])
+        msg = "Enregistré. Les nouvelles conditions s'appliquent aux prochaines commandes (les anciennes gardent leurs conditions)."
+    except sqlite3.IntegrityError:
+        supprimer_photo(ph)
+        msg = "Un autre partenaire porte déjà ce nom."
+    return redirect(url_for("partenaire", id=id, msg=msg))
+
+
+@app.route("/partenaires/<int:id>/lien", methods=["POST"])
+def regenerer_lien(id):
+    with db() as con:
+        con.execute("UPDATE partenaires SET token=? WHERE id=?", (secrets.token_urlsafe(16), id))
+    return redirect(url_for("partenaire", id=id, msg="Nouveau lien créé. L'ancien ne fonctionne plus."))
+
+
+@app.route("/partenaires/<int:id>/compte", methods=["POST"])
+def compte_partenaire_admin(id):
+    msg = enregistrer_compte_portail_admin("partenaire", id)
+    return redirect(url_for("partenaire", id=id, msg=msg))
+
+
+def _lire_article(f):
+    prix = nombre(f.get("prix", ""))
+    promo = nombre(f.get("promo_prix", "")) if f.get("promo_prix", "").strip() else 0
+    fin = f.get("promo_fin", "").strip()
+    return {"nom": f.get("nom", "").strip(), "description": f.get("description", "").strip()[:200],
+            "rubrique": f.get("rubrique", "").strip()[:40], "prix": prix if prix is not None and prix >= 0 else None,
+            "promo_prix": promo if promo and promo > 0 else 0, "promo_fin": fin if re.fullmatch(r"\d{4}-\d{2}-\d{2}", fin) else ""}
+
+
+@app.route("/partenaires/<int:id>/article", methods=["POST"])
+def ajouter_article(id):
+    d = _lire_article(request.form)
+    if not d["nom"] or d["prix"] is None:
+        return redirect(url_for("partenaire", id=id, msg="Il faut un nom et un prix valide."))
+    try:
+        ph = enregistrer_photo(request.files.get("photo"))
+    except ValueError as e:
+        return redirect(url_for("partenaire", id=id, msg=str(e)))
+    with db() as con:
+        con.execute("INSERT INTO articles(partenaire_id, nom, description, rubrique, prix, photo, dispo, cree_le) VALUES (?,?,?,?,?,?,1,?)",
+                    (id, d["nom"], d["description"], d["rubrique"], d["prix"], ph, maintenant()))
+    return redirect(url_for("partenaire", id=id, msg=f"« {d['nom']} » ajouté."))
+
+
+@app.route("/articles/<int:aid>/modifier", methods=["POST"])
+def modifier_article(aid):
+    with db() as con:
+        a = con.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
+    if not a:
+        return redirect(url_for("partenaires"))
+    d = _lire_article(request.form)
+    if not d["nom"] or d["prix"] is None:
+        return redirect(url_for("partenaire", id=a["partenaire_id"], msg="Il faut un nom et un prix valide."))
+    try:
+        ph = enregistrer_photo(request.files.get("photo"))
+    except ValueError as e:
+        return redirect(url_for("partenaire", id=a["partenaire_id"], msg=str(e)))
+    if ph:
+        supprimer_photo(a["photo"])
+    with db() as con:
+        con.execute("UPDATE articles SET nom=?, description=?, rubrique=?, prix=?, promo_prix=?, promo_fin=?, photo=?, dispo=?, vedette=? WHERE id=?",
+                    (d["nom"], d["description"], d["rubrique"], d["prix"], d["promo_prix"], d["promo_fin"], ph or a["photo"],
+                     1 if request.form.get("dispo") else 0, 1 if request.form.get("vedette") else 0, aid))
+    return redirect(url_for("partenaire", id=a["partenaire_id"], msg=f"« {d['nom']} » enregistré."))
+
+
+@app.route("/articles/<int:aid>/supprimer", methods=["POST"])
+def supprimer_article(aid):
+    with db() as con:
+        a = con.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
+        if a:
+            con.execute("DELETE FROM articles WHERE id=?", (aid,))
+    if not a:
+        return redirect(url_for("partenaires"))
+    supprimer_photo(a["photo"])
+    return redirect(url_for("partenaire", id=a["partenaire_id"], msg=f"« {a['nom']} » supprimé."))
+
+
+@app.route("/partenaires/<int:id>/versement", methods=["POST"])
+def versement(id):
+    montant = nombre(request.form.get("montant", ""))
+    sens = "du_partenaire" if request.form.get("sens") == "du_partenaire" else "aux_partenaire"
+    moyen = request.form.get("moyen", "Autre").strip()
+    if not montant or montant <= 0 or moyen not in {"Espèces", "Orange Money", "Moov Money", "Mobi Cash", "Autre"}:
+        return redirect(url_for("partenaire", id=id, msg="Montant invalide."))
+    with db() as con:
+        con.execute("INSERT INTO versements(partenaire_id, montant, sens, note, cree_le, moyen) VALUES (?,?,?,?,?,?)",
+                    (id, montant, sens, request.form.get("note", "").strip()[:120], maintenant(), moyen))
+    return redirect(url_for("partenaire", id=id, msg="Versement enregistré."))
+
+
+PAGE_RELEVE = BASE.replace("{% block corps %}{% endblock %}", """
+<style>@media print{.side,.haut,.bas,.noprint{display:none!important}.app{display:block}body{background:#fff}.card{box-shadow:none;border:0}}</style>
+<div class="entete"><div><h1>📄 Relevé {{ mois }}</h1><p>{{ p.nom }} · {{ entreprise }} · édité le {{ aujourdhui }}</p></div>
+<div class="actions noprint"><button onclick="window.print()">🖨️ Imprimer / PDF</button>
+{% if lien %}<a class="btn sec" href="{{ lien }}" target="_blank">💬 Résumé par WhatsApp</a>{% endif %}
+<a class="btn sec" href="{{ url_for('partenaire', id=p.id) }}">← Retour</a></div></div>
+<div class="card"><div class="stats">
+<div class="stat"><b>{{ b.nb }}</b><span>commandes livrées</span></div>
+<div class="stat"><b>{{ b.ventes|fcfa }} F</b><span>articles vendus</span></div>
+<div class="stat ambre"><b>{{ b.commission|fcfa }} F</b><span>commission {{ entreprise }}</span></div>
+<div class="stat"><b>{{ b.net|fcfa }} F</b><span>revenant au partenaire</span></div></div>
+<div class="scroll"><table style="margin-top:14px"><tr><th>Date</th><th>Commande</th><th>Articles</th><th>Ventes</th><th>Commission</th></tr>
+{% for l, ventes, com, net, effet in b.detail %}<tr><td>{{ (l.heure_livraison or l.cree_le or '')[:10] }}</td><td>{{ l.numero }}</td><td>{{ l.colis }}</td>
+<td>{{ ventes|fcfa }} F</td><td>{{ com|fcfa }} F</td></tr>{% else %}<tr><td class="mut" colspan="5">Aucune commande livrée ce mois-ci.</td></tr>{% endfor %}</table></div>
+<p style="margin-top:14px"><b>Solde actuel :</b> {% if b.solde > 0 %}{{ entreprise }} doit {{ b.solde|fcfa }} F à {{ p.nom }}{% elif b.solde < 0 %}{{ p.nom }} doit {{ (-b.solde)|fcfa }} F à {{ entreprise }}{% else %}comptes à jour{% endif %}
+(tous mois confondus, versements déduits).</p>
+<form method="get" class="noprint"><label>Autre mois</label><input type="month" name="mois" value="{{ mois }}" style="max-width:200px" onchange="this.form.submit()"></form></div>""")
+
+
+@app.route("/partenaires/<int:id>/releve")
+def releve(id):
+    with db() as con:
+        p = con.execute("SELECT * FROM partenaires WHERE id=?", (id,)).fetchone()
+    if not p:
+        return redirect(url_for("partenaires"))
+    mois = request.args.get("mois", "")
+    if not re.fullmatch(r"\d{4}-\d{2}", mois):
+        mois = datetime.now().strftime("%Y-%m")
+    b = bilan_partenaire(id, mois)
+    ent = nom_entreprise()
+    n = tel_wa(p["tel"])
+    resume = (f"Bonjour, voici votre récapitulatif {mois} chez {ent} : {b['nb']} commandes livrées, "
+              f"{fcfa(b['ventes'])} F d'articles vendus, commission {fcfa(b['commission'])} F, "
+              f"{fcfa(b['net'])} F vous reviennent. Merci pour votre confiance !")
+    lien = f"https://wa.me/{n}?text={quote(resume)}" if n else ""
+    return render_template_string(PAGE_RELEVE, p=p, b=b, mois=mois, entreprise=ent, lien=lien, aujourdhui=datetime.now().strftime("%d/%m/%Y"))
+
+
+# ---------- commande prise par l'équipe depuis le catalogue ----------
+PAGE_CMD = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="entete"><div><h1>🛒 Prendre une commande</h1><p>Pour un client qui appelle ou passe te voir : choisis le partenaire, indique les quantités, et la commande se crée avec le bon lieu de collecte, le montant et la commission.</p></div></div>
+{% if msg %}<div class="card"><b>{{ msg }}</b>{% if nouveau %} <a class="btn sec" href="{{ url_for('modifier', id=nouveau|int) }}">Ouvrir la commande</a>{% endif %}</div>{% endif %}
+<div class="card"><form method="get"><label style="margin-top:0">Partenaire</label><select name="p" onchange="this.form.submit()"><option value="">Choisir...</option>
+{% for x in parts %}<option value="{{ x.id }}" {{ 'selected' if p and p.id == x.id }}>{{ x.nom }}</option>{% endfor %}</select></form></div>
+{% if p %}<form method="post" class="card"><input type="hidden" name="p" value="{{ p.id }}"><h2>{{ p.nom }}</h2>
+<table>{% for a in articles %}<tr><td>{{ a.nom }}{% if promo_active(a) %} <span class="pastille ambre">promo −{{ pct_promo(a) }} %</span>{% endif %}<br>
+<span class="mut">{% if promo_active(a) %}<s>{{ a.prix|fcfa }}</s> <b>{{ prix_effectif(a)|fcfa }} F</b>{% else %}{{ a.prix|fcfa }} F{% endif %} {{ a.description }}</span></td>
+<td style="width:100px"><input type="number" min="0" max="99" name="q{{ a.id }}" value="0"></td></tr>
+{% else %}<tr><td class="mut">Ce partenaire n'a aucun article disponible.</td></tr>{% endfor %}</table>
+<div class="grille"><div><label>Nom du client</label><input name="client_nom"></div>
+<div><label>WhatsApp du client</label><input name="client_tel" placeholder="70 12 34 56"></div>
+<div><label>Adresse / repère de livraison</label><input name="livraison_adresse"></div>
+<div><label>Quartier de livraison</label><input name="livraison_quartier"></div>
+<div><label>Prix de la course (FCFA)</label><input name="prix_course" value="{{ p.course_defaut|int }}"></div>
+<div><label>Qui encaisse la course ?</label><select name="encaisse_course_prevu"><option>À préciser</option><option>Livreur</option><option>Notre équipe</option></select></div>
+<div><label>Canal</label><select name="canal"><option>Appel</option><option>WhatsApp</option><option>En personne</option></select></div></div>
+<label>Remarques</label><input name="remarques">
+<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" name="envoyer" value="1"> chercher et prévenir le livreur tout de suite (si WhatsApp est configuré)</label>
+<p><button>Créer la commande</button></p></form>{% endif %}""")
+
+
+@app.route("/commande-catalogue", methods=["GET", "POST"])
+def commande_catalogue():
+    pid = request.values.get("p", "")
+    with db() as con:
+        parts = con.execute("SELECT * FROM partenaires WHERE actif=1 ORDER BY nom").fetchall()
+        p = con.execute("SELECT * FROM partenaires WHERE id=?", (pid,)).fetchone() if pid.isdigit() else None
+        articles = con.execute("SELECT * FROM articles WHERE partenaire_id=? AND dispo=1 ORDER BY rubrique, nom", (p["id"],)).fetchall() if p else []
+    if request.method == "POST" and p:
+        lignes = []
+        for a in articles:
+            q = request.form.get(f"q{a['id']}", "0")
+            if q.isdigit() and 0 < int(q) <= 99:
+                lignes.append((a, int(q)))
+        if not lignes:
+            return redirect(url_for("commande_catalogue", p=p["id"], msg="Choisis au moins un article."))
+        f = request.form
+        v = {k: ("" if k not in NOMBRES else 0) for k in CLES}
+        v.update(client_nom=f.get("client_nom", "").strip(), livraison_adresse=f.get("livraison_adresse", "").strip(),
+                 livraison_quartier=f.get("livraison_quartier", "").strip(), remarques=f.get("remarques", "").strip(),
+                 prix_course=nombre(f.get("prix_course", "")) or 0,
+                 encaisse_course_prevu=f.get("encaisse_course_prevu") if f.get("encaisse_course_prevu") in ("À préciser", "Livreur", "Notre équipe") else "À préciser")
+        tel = tel_wa(f.get("client_tel", ""))
+        id = creer_livraison(v, tel, v["client_nom"], "Commande prise par l'équipe : " + resume_lignes(lignes))
+        canal = f.get("canal") if f.get("canal") in ("Appel", "WhatsApp", "En personne") else "Appel"
+        with db() as con:
+            con.execute("UPDATE livraisons SET canal=? WHERE id=?", (canal, id))
+        appliquer_partenaire(id, p, lignes, ecraser_collecte=True)
+        msg = "Commande créée."
+        if f.get("envoyer"):
+            with db() as con:
+                l = con.execute("SELECT * FROM livraisons WHERE id=?", (id,)).fetchone()
+            if manquants(l):
+                msg += " L'envoi au livreur n'est pas parti : il manque l'adresse de livraison."
+            elif not wa_configure():
+                msg += " WhatsApp n'est pas configuré : envoie la commande au livreur depuis le tableau de bord."
+            else:
+                if tel and canal == "WhatsApp":
+                    accuser_reception(id)
+                threading.Thread(target=dispatcher, args=(id,), daemon=True).start()
+                msg += " Le livreur est en cours de recherche (voir 🤖 WhatsApp pour le suivi)."
+        return redirect(url_for("commande_catalogue", p=p["id"], msg=msg, nouveau=id))
+    nouveau = request.args.get("nouveau", "")
+    return render_template_string(PAGE_CMD, parts=parts, p=p, articles=articles, msg=request.args.get("msg", ""),
+                                  nouveau=nouveau if nouveau.isdigit() else "")
+
+
+# ---------- revenus ----------
+def svg_barres(labels, series, couleurs, legendes):
+    """Petit graphique en barres (SVG), sans bibliothèque : fonctionne hors connexion."""
+    W, H, m = 700, 240, 30
+    n = max(len(labels), 1)
+    mx = max([max(s) for s in series] + [1])
+    pas = (W - 2 * m) / n
+    larg = pas * 0.7 / len(series)
+    out = [f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" style="max-height:280px">']
+    for k in range(4):
+        y = H - 36 - (H - 60) * k / 3
+        out.append(f'<line x1="{m}" x2="{W - m}" y1="{y:.1f}" y2="{y:.1f}" stroke="var(--bord)" stroke-width="1"/>')
+        out.append(f'<text x="{m - 4}" y="{y + 4:.1f}" font-size="10" text-anchor="end" fill="var(--mut)">{fcfa(mx * k / 3)}</text>')
+    for i, lab in enumerate(labels):
+        x0 = m + i * pas + pas * 0.15
+        for j, s in enumerate(series):
+            h = (H - 60) * (s[i] / mx)
+            out.append(f'<rect x="{x0 + j * larg:.1f}" y="{H - 36 - h:.1f}" width="{larg - 2:.1f}" height="{h:.1f}" rx="3" fill="{couleurs[j]}"/>')
+        out.append(f'<text x="{m + i * pas + pas / 2:.1f}" y="{H - 18}" font-size="10" text-anchor="middle" fill="var(--mut)">{lab}</text>')
+    for j, leg in enumerate(legendes):
+        out.append(f'<rect x="{m + j * 150}" y="{H - 10}" width="10" height="10" rx="2" fill="{couleurs[j]}"/>'
+                   f'<text x="{m + j * 150 + 14}" y="{H - 1}" font-size="11" fill="var(--mut)">{leg}</text>')
+    out.append("</svg>")
+    return Markup("".join(out))
+
+
+PAGE_REVENUS = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="entete"><div><h1>💰 Revenus</h1><p>Ce que rapporte l'activité : frais de course et commissions des partenaires, sur les commandes livrées.</p></div></div>
+<div class="stats" style="margin-bottom:18px">
+<div class="stat ambre"><b>{{ k.total|fcfa }} F</b><span>revenus du mois (courses + commissions){% if k.evol is not none %} · {{ '+' if k.evol >= 0 }}{{ k.evol }} % vs mois dernier{% endif %}</span></div>
+<div class="stat"><b>{{ k.courses|fcfa }} F</b><span>frais de course ({{ k.nb }} livraisons)</span></div>
+<div class="stat"><b>{{ k.commissions|fcfa }} F</b><span>commissions des partenaires</span></div>
+<div class="stat"><b>{{ k.panier|fcfa }} F</b><span>panier moyen des articles</span></div></div>
+<div class="card"><h2>💸 Versements aux livreurs</h2>
+<p class="mut">Total enregistré ce mois-ci : <b>{{ total_versements|fcfa }} F</b>. Enregistre ici les paiements réellement effectués.</p>
+{% if erreur %}<p class="pastille rouge">{{ erreur }}</p>{% endif %}
+{% if livreurs_disponibles %}<form method="post" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;align-items:end">
+<label>Livreur<select name="livreur_id" required><option value="">Choisir un livreur</option>{% for l in livreurs_disponibles %}<option value="{{ l.id }}" {{ 'selected' if selected_livreur|int == l.id }}>{{ l.nom }}{% if not l.actif %} · inactif{% endif %}</option>{% endfor %}</select></label>
+<label>Montant (FCFA)<input name="montant" type="number" min="1" step="1" required placeholder="Ex. 5000"></label>
+<label>Date du paiement<input name="paye_le" type="date" value="{{ date_aujourdhui }}" required></label>
+<label>Moyen<select name="moyen" required><option>Espèces</option><option>Orange Money</option><option>Moov Money</option><option>Mobi Cash</option><option>Autre</option></select></label>
+<label>Note (facultatif)<input name="note" maxlength="200" placeholder="Ex. avance, semaine 12…"></label>
+<button class="btn" type="submit">Enregistrer le versement</button></form>
+{% else %}<p class="vide">Ajoute d’abord un livreur dans la rubrique Livreurs pour enregistrer ses paiements.</p>{% endif %}</div>
+<div class="card"><h2>Derniers versements</h2>{% if versements %}<div class="scroll"><table><tr><th>Date</th><th>Livreur</th><th>Moyen</th><th>Note</th><th>Montant</th></tr>
+{% for v in versements %}<tr><td>{{ v.paye_le }}</td><td>{{ v.livreur_nom }}</td><td>{{ v.moyen }}</td><td>{{ v.note or '—' }}</td><td><b>{{ v.montant|fcfa }} F</b></td></tr>{% endfor %}</table></div>
+{% else %}<p class="vide">Aucun versement enregistré pour le moment.</p>{% endif %}</div>
+<div class="card"><h2>8 dernières semaines</h2>{{ graphique }}</div>
+<div class="grille" style="gap:0 18px">
+<div class="card"><h2>🏆 Partenaires (ce mois)</h2>{% for p in top_parts %}<div class="ligne"><div><b>{{ p.nom }}</b><br><span class="mut">{{ p.nb }} commandes · {{ p.ventes|fcfa }} F de ventes</span></div><b>{{ p.com|fcfa }} F</b></div>
+{% else %}<p class="vide">Pas encore de vente livrée ce mois-ci.</p>{% endfor %}</div>
+<div class="card"><h2>🍽️ Articles les plus vendus (ce mois)</h2>{% for a in top_arts %}<div class="ligne"><div><b>{{ a.nom }}</b><br><span class="mut">{{ a.pnom }}</span></div><div style="text-align:right"><b>{{ a.q }}</b><br><span class="mut">{{ a.ca|fcfa }} F</span></div></div>
+{% else %}<p class="vide">Aucun article vendu via le catalogue ce mois-ci.</p>{% endfor %}</div></div>
+<div class="grille" style="gap:0 18px">
+<div class="card"><h2>🏍️ Livreurs (ce mois)</h2>{% for l in livreurs %}<div class="ligne"><div><b>{{ l.nom }}</b><br><span class="mut">{{ l.nb }} livraisons · {{ l.courses|fcfa }} F de courses</span></div>
+<span class="pastille {{ 'ambre' if l.note and l.note < 4 }}">{% if l.note %}★ {{ l.note }} ({{ l.nb_avis }}){% else %}pas d'avis{% endif %}</span></div>
+{% else %}<p class="vide">Aucune livraison ce mois-ci.</p>{% endfor %}</div>
+<div class="card"><h2>⭐ Satisfaction des clients</h2>{% if avis.n %}<div class="stats"><div class="stat"><b>{{ avis.moy }}/5</b><span>note moyenne ({{ avis.n }} avis)</span></div>
+<div class="stat"><b>{{ avis.pos }} %</b><span>😍 très satisfaits</span></div><div class="stat rouge"><b>{{ avis.neg }} %</b><span>😕 pas satisfaits</span></div></div>
+{% else %}<p class="vide">Les avis arrivent après chaque livraison WhatsApp : le client reçoit trois boutons (😍 🙂 😕).</p>{% endif %}</div></div>
+<p class="mut">Les frais de course sont comptés en brut : ce que tu verses aux livreurs n'est pas déduit.</p>
+""")
+
+
+@app.route("/revenus", methods=["GET", "POST"])
+def revenus():
+    auj = datetime.now().date()
+    mois = auj.strftime("%Y-%m")
+    mois_prec = (auj.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    jour = "substr(COALESCE(NULLIF(heure_livraison,''), cree_le),1,10)"
+    erreur = ""
+    selected_livreur = (request.form.get("livreur_id", "") if request.method == "POST"
+                        else request.args.get("livreur_id", ""))
+    if request.method == "POST":
+        try:
+            livreur_id = int(request.form.get("livreur_id", ""))
+            montant = int(request.form.get("montant", ""))
+            paye_le = request.form.get("paye_le", "").strip()
+            moyen = request.form.get("moyen", "").strip()
+            note = request.form.get("note", "").strip()[:200]
+            datetime.strptime(paye_le, "%Y-%m-%d")
+            if montant <= 0 or montant > 9223372036854775807:
+                raise ValueError
+            if moyen not in {"Espèces", "Orange Money", "Moov Money", "Mobi Cash", "Autre"}:
+                raise ValueError
+            with db() as con:
+                livreur = con.execute("SELECT id, nom FROM livreurs WHERE id=?", (livreur_id,)).fetchone()
+                if not livreur:
+                    raise ValueError
+                con.execute("INSERT INTO paiements_livreurs(livreur_id, livreur_nom, montant, moyen, note, paye_le, cree_le) "
+                            "VALUES (?,?,?,?,?,?,?)",
+                            (livreur["id"], livreur["nom"], montant, moyen, note, paye_le, maintenant()))
+            return redirect(url_for("revenus", livreur_id=livreur_id))
+        except (TypeError, ValueError):
+            erreur = "Vérifie le livreur, le montant, la date et le moyen de paiement."
+    with db() as con:
+        livrees = con.execute(f"SELECT *, {jour} AS jour FROM livraisons WHERE statut='livré'").fetchall()
+        avis_rows = con.execute("SELECT * FROM avis").fetchall()
+        lignes = con.execute("SELECT lc.nom, lc.quantite, lc.prix, l.partenaire_id, substr(COALESCE(NULLIF(l.heure_livraison,''), l.cree_le),1,7) m "
+                             "FROM lignes_commande lc JOIN livraisons l ON l.id=lc.livraison_id WHERE l.statut='livré'").fetchall()
+        noms_p = {r["id"]: r["nom"] for r in con.execute("SELECT id, nom FROM partenaires")}
+        livreurs_disponibles = con.execute("SELECT id, nom, actif FROM livreurs ORDER BY actif DESC, nom COLLATE NOCASE").fetchall()
+        total_versements = con.execute("SELECT COALESCE(SUM(montant),0) FROM paiements_livreurs WHERE substr(paye_le,1,7)=?", (mois,)).fetchone()[0]
+        versements = con.execute("SELECT livreur_nom, montant, moyen, note, paye_le FROM paiements_livreurs "
+                                 "ORDER BY paye_le DESC, id DESC LIMIT 50").fetchall()
+
+    def totaux(rows):
+        courses = sum(r["prix_course"] or 0 for r in rows)
+        com = sum(calcul_ligne(r)[1] for r in rows if r["partenaire_id"])
+        return courses, com
+
+    du_mois = [r for r in livrees if r["jour"][:7] == mois]
+    prec = [r for r in livrees if r["jour"][:7] == mois_prec]
+    c, k = totaux(du_mois)
+    cp, kp = totaux(prec)
+    avec_art = [r for r in du_mois if (r["valeur_produit"] or 0) > 0]
+    kpi = {"courses": c, "commissions": k, "total": c + k, "nb": len(du_mois),
+           "evol": round(100 * ((c + k) - (cp + kp)) / (cp + kp)) if (cp + kp) else None,
+           "panier": round(sum(r["valeur_produit"] for r in avec_art) / len(avec_art)) if avec_art else 0}
+    # 8 dernières semaines (du lundi au dimanche)
+    lundi = auj - timedelta(days=auj.weekday())
+    semaines = [lundi - timedelta(weeks=i) for i in range(7, -1, -1)]
+    lab, s_courses, s_com = [], [], []
+    for d0 in semaines:
+        d1 = d0 + timedelta(days=6)
+        rows = [r for r in livrees if d0.isoformat() <= r["jour"] <= d1.isoformat()]
+        cc, kk = totaux(rows)
+        lab.append(d0.strftime("%d/%m")); s_courses.append(cc); s_com.append(kk)
+    graphique = svg_barres(lab, [s_courses, s_com], ["var(--vert2)", "var(--ambre)"], ["Frais de course", "Commissions"])
+    par_part = {}
+    for r in du_mois:
+        if r["partenaire_id"]:
+            d = par_part.setdefault(r["partenaire_id"], {"nom": noms_p.get(r["partenaire_id"], "?"), "nb": 0, "ventes": 0, "com": 0})
+            ve, co = calcul_ligne(r)[:2]
+            d["nb"] += 1; d["ventes"] += ve; d["com"] += co
+    top_parts = sorted(par_part.values(), key=lambda d: -d["com"])[:6]
+    par_art = {}
+    for r in lignes:
+        if r["m"] == mois:
+            d = par_art.setdefault((r["nom"], r["partenaire_id"]), {"nom": r["nom"], "pnom": noms_p.get(r["partenaire_id"], ""), "q": 0, "ca": 0})
+            d["q"] += r["quantite"]; d["ca"] += r["quantite"] * r["prix"]
+    top_arts = sorted(par_art.values(), key=lambda d: -d["q"])[:6]
+    par_liv = {}
+    for r in du_mois:
+        d = par_liv.setdefault(r["livreur"] or "(sans livreur)", {"nom": r["livreur"] or "(sans livreur)", "nb": 0, "courses": 0})
+        d["nb"] += 1; d["courses"] += r["prix_course"] or 0
+    notes_liv = {}
+    for a in avis_rows:
+        notes_liv.setdefault(a["livreur"], []).append(a["note"])
+    livreurs = []
+    for d in sorted(par_liv.values(), key=lambda d: -d["nb"]):
+        ns = notes_liv.get(d["nom"], [])
+        livreurs.append(dict(d, note=round(sum(ns) / len(ns), 1) if len(ns) >= 3 else None, nb_avis=len(ns)))
+    n = len(avis_rows)
+    avis = {"n": n, "moy": round(sum(a["note"] for a in avis_rows) / n, 1) if n else 0,
+            "pos": round(100 * sum(1 for a in avis_rows if a["note"] == 5) / n) if n else 0,
+            "neg": round(100 * sum(1 for a in avis_rows if a["note"] == 1) / n) if n else 0}
+    return render_template_string(PAGE_REVENUS, k=kpi, graphique=graphique, top_parts=top_parts, top_arts=top_arts,
+                                  livreurs=livreurs, avis=avis, livreurs_disponibles=livreurs_disponibles,
+                                  total_versements=total_versements, versements=versements, erreur=erreur,
+                                  date_aujourdhui=auj.isoformat(), selected_livreur=selected_livreur)
+
+
+# ---------- caisse : mouvements réels et clôture quotidienne ----------
+MOYENS_CAISSE = ("Espèces", "Orange Money", "Moov Money", "Mobi Cash", "Autre")
+CATEGORIES_CAISSE = {
+    "entree": {"Encaissement client", "Remise de livreur", "Autre entrée"},
+    "sortie": {"Dépense opérationnelle", "Remboursement client", "Autre sortie"},
+}
+
+PAGE_CAISSE = BASE.replace("{% block corps %}{% endblock %}", """
+<div class="entete"><div><h1>🧾 Caisse</h1><p>Suivi des mouvements réellement reçus ou payés, puis rapprochement par moyen de paiement.</p></div></div>
+<div class="card"><form method="get" style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+<label style="min-width:210px">Journée à clôturer<input type="date" name="date" value="{{ date_jour }}" required></label>
+<button class="sec" type="submit">Afficher la journée</button></form>
+<p class="mut">Le statut « Payé » confirme que le client a réglé, mais pas que l'argent a été remis à ta caisse. Si le livreur détient encore la somme, elle n'entre pas dans le solde disponible. Quand tu reçois réellement l'argent du livreur, enregistre ici une entrée « Remise de livreur » avec la date et le moyen réellement reçus.</p></div>
+{% if message %}<div class="card"><span class="pastille {{ 'rouge' if erreur else '' }}">{{ message }}</span></div>{% endif %}
+<div class="stats" style="margin-bottom:18px">
+<div class="stat"><b>{{ total_entrees|fcfa }} F</b><span>entrées de la journée</span></div>
+<div class="stat rouge"><b>{{ total_sorties|fcfa }} F</b><span>sorties de la journée</span></div>
+<div class="stat {{ 'ambre' if net_jour < 0 else '' }}"><b>{{ net_jour|fcfa }} F</b><span>mouvement net (hors solde d'ouverture)</span></div></div>
+<div class="card">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap"><div><h2>💸 Sommes à remettre par les livreurs</h2><p class="mut">Ces montants restent hors caisse jusqu’à leur remise réelle. Les tests WhatsApp sont exclus.</p></div><b>{{ total_a_remettre|fcfa }} F · {{ remises_en_attente|length }} course(s)</b></div>
+{% if remises_en_attente %}<div class="scroll"><table><thead><tr><th>Commande / client</th><th>Livreur</th><th>Montant reçu</th><th>Enregistrer la remise réelle</th></tr></thead><tbody>
+{% for r in remises_en_attente %}<tr><td><b>{{ r.numero }}</b><br><span class="mut">{{ r.client_nom or r.client_tel or 'Client' }}</span></td><td>{{ r.livreur or 'Livreur non renseigné' }}</td><td><b>{{ r.montant_encaisse_livreur|fcfa }} F</b><br><span class="mut">reçu {{ r.heure_paiement or 'date inconnue' }}</span></td><td><form method="post" action="{{ url_for('caisse') }}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap" onsubmit="return confirm('Confirmer que tu as réellement reçu {{ r.montant_encaisse_livreur|fcfa }} F pour {{ r.numero }} ?')">
+<input type="hidden" name="action" value="remise_livreur"><input type="hidden" name="livraison_id" value="{{ r.id }}"><input type="hidden" name="date_retour" value="{{ date_jour }}">
+<select name="moyen" required><option value="" selected disabled>Choisir le moyen</option>{% for m in moyens %}<option>{{ m }}</option>{% endfor %}</select><input type="date" name="date_operation" value="{{ date_operation_defaut }}" required aria-label="Date réelle de la remise"><input name="note" maxlength="120" placeholder="Note (facultatif)"><button type="submit">Confirmer la remise</button></form></td></tr>{% endfor %}
+</tbody></table></div>{% else %}<p class="vide">Aucune somme à remettre pour le moment. Une course apparaîtra ici quand un livreur aura confirmé avoir reçu le paiement.</p>{% endif %}</div>
+<div class="card"><h2>➕ Enregistrer un mouvement réel</h2>
+<form method="post" action="{{ url_for('caisse') }}" class="grille">
+<input type="hidden" name="action" value="mouvement"><input type="hidden" name="date_retour" value="{{ date_jour }}">
+<div><label>Sens</label><select name="sens" id="caisse-sens" required><option value="entree">Argent reçu</option><option value="sortie">Argent payé</option></select></div>
+<div><label>Catégorie</label><select name="categorie" id="caisse-categorie" required><optgroup label="Entrée"><option>Encaissement client</option><option>Remise de livreur</option><option>Autre entrée</option></optgroup><optgroup label="Sortie"><option>Dépense opérationnelle</option><option>Remboursement client</option><option>Autre sortie</option></optgroup></select></div>
+<div><label>Montant (FCFA)</label><input name="montant" type="number" min="1" step="1" required placeholder="Ex. 2500"></div>
+<div><label>Moyen</label><select name="moyen" required>{% for m in moyens %}<option>{{ m }}</option>{% endfor %}</select></div>
+<div><label>Date réelle du mouvement</label><input name="date_operation" type="date" value="{{ date_jour }}" required></div>
+<div><label>Commande, motif ou note</label><input name="note" maxlength="200" placeholder="Ex. commande 042, carburant…"></div>
+<div style="align-self:end"><button type="submit">Enregistrer le mouvement</button></div></form>
+<p class="mut">Les sommes que tu verses aux livreurs (dans Revenus) et les règlements partenaires sont repris ici automatiquement. Ne les saisis pas une deuxième fois. Une remise d'argent par un livreur se saisit ci-dessus lorsqu'elle a réellement lieu.</p>
+<p class="mut">Les frais notés sur une livraison ne sont pas ajoutés automatiquement : leur date réelle de paiement n'est pas connue. Saisis la dépense le jour où tu la paies.</p></div>
+<div class="card"><h2>📊 Clôture par moyen de paiement · {{ date_affichee }}</h2>
+<p class="mut">Le solde attendu = ouverture + entrées − sorties. Compte ensuite le solde réellement disponible pour chaque moyen et enregistre la clôture. Le solde réel, augmenté des mouvements des jours non clôturés, sert d'ouverture suivante. Pour la première clôture, saisis toi-même le solde disponible au début de la journée.</p>
+<div class="scroll"><table><thead><tr><th>Moyen</th><th>Entrées</th><th>Sorties</th><th>Ouverture</th><th>Solde attendu</th><th>Solde réel / clôture</th></tr></thead><tbody>
+{% for r in clotures %}<tr><td><b>{{ r.moyen }}</b></td><td>{{ r.entrees|fcfa }} F</td><td>{{ r.sorties|fcfa }} F</td><td>{{ r.ouverture|fcfa }} F</td><td><b>{{ r.attendu|fcfa }} F</b></td><td>
+<form method="post" action="{{ url_for('caisse') }}" style="display:grid;grid-template-columns:repeat(2,minmax(110px,1fr));gap:6px;min-width:250px">
+<input type="hidden" name="action" value="cloturer"><input type="hidden" name="date_cloture" value="{{ date_jour }}"><input type="hidden" name="moyen" value="{{ r.moyen }}">
+<label style="margin:0">Ouverture<input name="ouverture" type="number" step="1" value="{{ r.ouverture }}" required></label>
+<label style="margin:0">Compté<input name="solde_reel" type="number" step="1" value="{{ r.solde_reel if r.cloture else '' }}" placeholder="Solde compté" required></label>
+<label style="grid-column:1/-1;margin:0">Note (facultatif)<input name="note" maxlength="200" value="{{ r.note if r.cloture else '' }}" placeholder="Écart expliqué, transfert…"></label>
+<div style="grid-column:1/-1;display:flex;justify-content:space-between;align-items:center;gap:8px"><span class="pastille {{ 'rouge' if r.ecart is not none and r.ecart != 0 else '' }}">{% if r.ecart is not none %}Écart : {{ r.ecart|fcfa }} F{% else %}À clôturer{% endif %}</span><button type="submit">{{ 'Mettre à jour' if r.cloture else 'Clôturer' }}</button></div></form></td></tr>{% endfor %}
+</tbody></table></div></div>
+<div class="card"><h2>Mouvements du {{ date_affichee }}</h2>
+{% if mouvements %}<div class="scroll"><table><thead><tr><th>Heure / date</th><th>Type</th><th>Détail</th><th>Moyen</th><th>Montant</th></tr></thead><tbody>
+{% for m in mouvements %}<tr><td>{{ m.heure }}</td><td>{{ m.categorie }}</td><td>{{ m.note or '—' }}</td><td>{{ m.moyen }}</td><td><b class="{{ 'payé' if m.sens == 'entree' }}">{{ '+' if m.sens == 'entree' else '−' }}{{ m.montant|fcfa }} F</b></td></tr>{% endfor %}
+</tbody></table></div>{% else %}<p class="vide">Aucun mouvement enregistré pour cette journée.</p>{% endif %}</div>
+""")
+PAGE_CAISSE = PAGE_CAISSE.replace("</body></html>", """<script>
+const sensCaisse=document.getElementById('caisse-sens');
+const categorieCaisse=document.getElementById('caisse-categorie');
+if(sensCaisse&&categorieCaisse){
+  const groupes=[...categorieCaisse.querySelectorAll('optgroup')];
+  function filtrerCategories(){
+    const entree=sensCaisse.value==='entree';
+    groupes.forEach((g,i)=>g.hidden=(i===0)!==entree);
+    const actif=entree?groupes[0]:groupes[1];
+    if(!actif.contains(categorieCaisse.selectedOptions[0]))categorieCaisse.value=actif.querySelector('option').value;
+  }
+  sensCaisse.addEventListener('change',filtrerCategories);filtrerCategories();
+}
+</script></body></html>""")
+
+
+@app.route("/caisse", methods=["GET", "POST"])
+def caisse():
+    auj = datetime.now().date().isoformat()
+    message = request.args.get("msg", "")[:200]
+    erreur = request.args.get("erreur", "") == "1"
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        try:
+            if action == "remise_livreur":
+                livraison_id = int(request.form.get("livraison_id", ""))
+                moyen = request.form.get("moyen", "")
+                date_operation = request.form.get("date_operation", "").strip()
+                datetime.strptime(date_operation, "%Y-%m-%d")
+                if moyen not in MOYENS_CAISSE:
+                    raise ValueError
+                note_supplementaire = request.form.get("note", "").strip()[:120]
+                with db() as con:
+                    con.execute("BEGIN IMMEDIATE")
+                    l = con.execute("SELECT l.id, l.numero, l.livreur, l.montant_encaisse_livreur "
+                                    "FROM livraisons l LEFT JOIN remises_livreurs r ON r.livraison_id=l.id "
+                                    "WHERE l.id=? AND l.paiement_recu_par='livreur' "
+                                    "AND l.statut_paiement='payé' AND COALESCE(l.message_original,'') NOT LIKE '[TEST]%' "
+                                    "AND COALESCE(l.montant_encaisse_livreur,0)>0 AND r.id IS NULL", (livraison_id,)).fetchone()
+                    if not l:
+                        return redirect(url_for("caisse", date=request.form.get("date_retour") or auj,
+                                                msg="Cette remise n’est plus en attente ou la commande est un test.", erreur=1))
+                    montant = int(l["montant_encaisse_livreur"] or 0)
+                    if montant <= 0:
+                        raise ValueError
+                    numero = l["numero"] or f"LIV-{l['id']:04d}"
+                    livreur_nom = l["livreur"] or "Livreur"
+                    note_caisse = f"{numero} · {livreur_nom}" + (f" · {note_supplementaire}" if note_supplementaire else "")
+                    con.execute("INSERT INTO remises_livreurs(livraison_id, livreur_nom, montant, moyen, date_operation, note, cree_le) "
+                                "VALUES (?,?,?,?,?,?,?)",
+                                (livraison_id, livreur_nom, montant, moyen, date_operation, note_supplementaire, maintenant()))
+                    con.execute("INSERT INTO mouvements_caisse(sens, categorie, montant, moyen, date_operation, note, cree_le) "
+                                "VALUES ('entree','Remise de livreur',?,?,?,?,?)",
+                                (montant, moyen, date_operation, note_caisse, maintenant()))
+                return redirect(url_for("caisse", date=date_operation,
+                                        msg=f"Remise réelle de {fcfa(montant)} F enregistrée pour {numero}."))
+            if action == "mouvement":
+                sens = request.form.get("sens", "")
+                categorie = request.form.get("categorie", "")
+                montant = int(request.form.get("montant", ""))
+                moyen = request.form.get("moyen", "")
+                date_operation = request.form.get("date_operation", "").strip()
+                datetime.strptime(date_operation, "%Y-%m-%d")
+                if sens not in CATEGORIES_CAISSE or categorie not in CATEGORIES_CAISSE[sens]:
+                    raise ValueError
+                if montant <= 0 or montant > 9223372036854775807 or moyen not in MOYENS_CAISSE:
+                    raise ValueError
+                with db() as con:
+                    con.execute("INSERT INTO mouvements_caisse(sens, categorie, montant, moyen, date_operation, note, cree_le) VALUES (?,?,?,?,?,?,?)",
+                                (sens, categorie, montant, moyen, date_operation,
+                                 request.form.get("note", "").strip()[:200], maintenant()))
+                return redirect(url_for("caisse", date=date_operation, msg="Mouvement enregistré."))
+            if action == "cloturer":
+                date_cloture = request.form.get("date_cloture", "").strip()
+                datetime.strptime(date_cloture, "%Y-%m-%d")
+                moyen = request.form.get("moyen", "")
+                ouverture = int(request.form.get("ouverture", ""))
+                solde_reel = int(request.form.get("solde_reel", ""))
+                if moyen not in MOYENS_CAISSE or min(ouverture, solde_reel) < 0 or max(ouverture, solde_reel) > 9223372036854775807:
+                    raise ValueError
+                with db() as con:
+                    con.execute("INSERT INTO clotures_caisse(date_cloture, moyen, solde_ouverture, solde_reel, note, cree_le) "
+                                "VALUES (?,?,?,?,?,?) ON CONFLICT(date_cloture, moyen) DO UPDATE SET "
+                                "solde_ouverture=excluded.solde_ouverture, solde_reel=excluded.solde_reel, "
+                                "note=excluded.note, cree_le=excluded.cree_le",
+                                (date_cloture, moyen, ouverture, solde_reel,
+                                 request.form.get("note", "").strip()[:200], maintenant()))
+                return redirect(url_for("caisse", date=date_cloture, msg=f"Clôture {moyen} enregistrée."))
+            raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            date_retour = request.form.get("date_retour") or request.form.get("date_cloture") or auj
+            try:
+                datetime.strptime(date_retour, "%Y-%m-%d")
+            except ValueError:
+                date_retour = auj
+            return redirect(url_for("caisse", date=date_retour, msg="Vérifie les informations saisies.", erreur=1))
+
+    date_jour = request.args.get("date", auj)
+    try:
+        jour = datetime.strptime(date_jour, "%Y-%m-%d").date()
+        date_jour = jour.isoformat()
+    except ValueError:
+        jour = datetime.strptime(auj, "%Y-%m-%d").date()
+        date_jour = auj
+    mouvements = []
+    with db() as con:
+        for r in con.execute("SELECT sens, categorie, montant, moyen, note, cree_le FROM mouvements_caisse WHERE date_operation=?", (date_jour,)):
+            mouvements.append({"date": date_jour, "heure": r["cree_le"], "sens": r["sens"], "categorie": r["categorie"],
+                               "montant": r["montant"], "moyen": r["moyen"], "note": r["note"]})
+        for r in con.execute("SELECT paye_le, montant, moyen, livreur_nom, note, cree_le FROM paiements_livreurs WHERE paye_le=?", (date_jour,)):
+            mouvements.append({"date": date_jour, "heure": r["cree_le"] or r["paye_le"], "sens": "sortie", "categorie": "Paiement livreur",
+                               "montant": r["montant"], "moyen": r["moyen"] if r["moyen"] in MOYENS_CAISSE else "Autre",
+                               "note": r["livreur_nom"] + (" · " + r["note"] if r["note"] else "")})
+        remises_en_attente = con.execute("SELECT l.id, l.numero, l.client_nom, l.client_tel, l.livreur, "
+                                         "l.heure_paiement, l.montant_encaisse_livreur "
+                                         "FROM livraisons l LEFT JOIN remises_livreurs r ON r.livraison_id=l.id "
+                                         "WHERE l.paiement_recu_par='livreur' AND l.statut_paiement='payé' "
+                                         "AND COALESCE(l.message_original,'') NOT LIKE '[TEST]%' "
+                                         "AND COALESCE(l.montant_encaisse_livreur,0)>0 AND r.id IS NULL "
+                                         "ORDER BY l.livreur COLLATE NOCASE, l.heure_paiement, l.id").fetchall()
+        for r in con.execute("SELECT v.montant, v.sens, v.moyen, v.note, v.cree_le, p.nom FROM versements v "
+                             "LEFT JOIN partenaires p ON p.id=v.partenaire_id WHERE substr(v.cree_le,1,10)=?", (date_jour,)):
+            entree = r["sens"] == "du_partenaire"
+            mouvements.append({"date": date_jour, "heure": r["cree_le"], "sens": "entree" if entree else "sortie",
+                               "categorie": "Règlement partenaire", "montant": int(round(r["montant"] or 0)),
+                               "moyen": r["moyen"] if r["moyen"] in MOYENS_CAISSE else "Autre",
+                               "note": (r["nom"] or "Partenaire") + (" · " + r["note"] if r["note"] else "")})
+        clotures_existantes = {r["moyen"]: r for r in con.execute("SELECT * FROM clotures_caisse WHERE date_cloture=?", (date_jour,))}
+        precedentes = {}
+        for moyen in MOYENS_CAISSE:
+            prec = con.execute("SELECT date_cloture, solde_reel FROM clotures_caisse WHERE moyen=? AND date_cloture<? ORDER BY date_cloture DESC LIMIT 1",
+                               (moyen, date_jour)).fetchone()
+            if not prec:
+                precedentes[moyen] = 0
+                continue
+            debut = prec["date_cloture"]
+            flux = con.execute("SELECT COALESCE(SUM(CASE WHEN sens='entree' THEN montant ELSE -montant END),0) "
+                                "FROM mouvements_caisse WHERE moyen=? AND date_operation>? AND date_operation<?",
+                                (moyen, debut, date_jour)).fetchone()[0]
+            flux -= con.execute("SELECT COALESCE(SUM(montant),0) FROM paiements_livreurs "
+                                "WHERE moyen=? AND paye_le>? AND paye_le<?",
+                                (moyen, debut, date_jour)).fetchone()[0]
+            flux += con.execute("SELECT COALESCE(SUM(CASE WHEN sens='du_partenaire' THEN montant ELSE -montant END),0) "
+                                "FROM versements WHERE COALESCE(moyen,'Autre')=? AND substr(cree_le,1,10)>? AND substr(cree_le,1,10)<?",
+                                (moyen, debut, date_jour)).fetchone()[0]
+            precedentes[moyen] = prec["solde_reel"] + flux
+
+    total_a_remettre = sum(int(r["montant_encaisse_livreur"] or 0) for r in remises_en_attente)
+    entrees, sorties = {m: 0 for m in MOYENS_CAISSE}, {m: 0 for m in MOYENS_CAISSE}
+    for m in mouvements:
+        m["moyen"] = m["moyen"] if m["moyen"] in MOYENS_CAISSE else "Autre"
+        (entrees if m["sens"] == "entree" else sorties)[m["moyen"]] += m["montant"]
+        m["heure"] = (m["heure"] or m["date"])[5:16]
+    mouvements.sort(key=lambda m: m["heure"], reverse=True)
+    clotures = []
+    for moyen in MOYENS_CAISSE:
+        c = clotures_existantes.get(moyen)
+        ouverture = c["solde_ouverture"] if c else precedentes[moyen]
+        attendu = ouverture + entrees[moyen] - sorties[moyen]
+        reel = c["solde_reel"] if c else None
+        clotures.append({"moyen": moyen, "entrees": entrees[moyen], "sorties": sorties[moyen],
+                         "ouverture": ouverture, "attendu": attendu, "solde_reel": reel,
+                         "note": c["note"] if c else "", "cloture": bool(c),
+                         "ecart": (reel - attendu) if c else None})
+    total_entrees = sum(entrees.values())
+    total_sorties = sum(sorties.values())
+    return render_template_string(PAGE_CAISSE, date_jour=date_jour, date_affichee=jour.strftime("%d/%m/%Y"),
+                                  mouvements=mouvements, clotures=clotures, moyens=MOYENS_CAISSE,
+                                  total_entrees=total_entrees, total_sorties=total_sorties,
+                                  remises_en_attente=remises_en_attente, total_a_remettre=total_a_remettre,
+                                  date_operation_defaut=auj, net_jour=total_entrees-total_sorties,
+                                  message=message, erreur=erreur)
+
+
+# ---------- espace CLIENT : la boutique ----------
+SHOP_CSS = """
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#0b7a3b">
+<style>
+:root{--bg:#f5f8f6;--card:#fff;--txt:#14201a;--mut:#69786f;--vert:#0b7a3b;--vert2:#13a355;--ambre:#f0a500;--bord:#e3e9e5;--soft:rgba(11,122,59,.08);--ombre:0 1px 2px rgba(15,40,25,.05),0 10px 28px rgba(15,40,25,.07)}
+@media(prefers-color-scheme:dark){:root{--bg:#0b120e;--card:#151f19;--txt:#e8f0ea;--mut:#8da296;--bord:#23322a;--soft:rgba(46,204,113,.1);--ombre:none}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);line-height:1.45}
+a{color:inherit}.wrap{max-width:880px;margin:0 auto;padding:0 16px}.mut{color:var(--mut);font-size:.88rem}
+.hero{background:radial-gradient(900px 320px at 90% -30%,rgba(255,255,255,.2),transparent),linear-gradient(135deg,#0b7a3b,#054a21);color:#fff;padding:calc(16px + env(safe-area-inset-top,0px)) 0 30px}
+.hero.petit{padding-bottom:20px}.hero a{color:#fff;text-decoration:none}
+.marque{display:flex;align-items:center;justify-content:space-between;font-weight:800;letter-spacing:.3px}
+.marque span.t{display:flex;align-items:center;gap:8px}
+h1.titre{font-size:clamp(1.8rem,6.5vw,2.7rem);line-height:1.08;margin:22px 0 8px;letter-spacing:-.03em}
+.hero p{margin:0;opacity:.92;max-width:48ch}
+.recherche{display:flex;gap:6px;margin-top:20px;background:#fff;border-radius:999px;padding:6px;box-shadow:0 12px 32px rgba(0,0,0,.25)}
+.recherche input{flex:1;min-width:0;border:0;outline:0;padding:10px 14px;font-size:1rem;background:transparent;color:#14201a;font-family:inherit}
+.recherche button{border:0;border-radius:999px;background:linear-gradient(135deg,var(--vert2),var(--vert));color:#fff;font-weight:700;padding:0 18px;cursor:pointer;font-family:inherit}
+main{padding:22px 0 120px}section{margin-bottom:28px}
+h2.s{font-size:1.15rem;margin:0 0 12px;letter-spacing:-.01em;display:flex;align-items:center;justify-content:space-between}
+h2.s a{font-size:.85rem;font-weight:600;color:var(--vert);text-decoration:none}
+.rayons{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:12px}
+.rayon{background:var(--card);border:1px solid var(--bord);border-radius:20px;padding:16px 10px;text-align:center;text-decoration:none;box-shadow:var(--ombre);display:flex;flex-direction:column;gap:6px;align-items:center;transition:transform .15s}
+.rayon:hover{transform:translateY(-2px)}.rayon .ico{width:58px;height:58px;border-radius:19px;background:linear-gradient(135deg,rgba(19,163,85,.2),rgba(11,122,59,.06));display:grid;place-items:center;font-size:1.9rem}
+.rayon b{font-size:.95rem;line-height:1.2}.rayon small{color:var(--mut)}
+.offres{display:flex;gap:12px;overflow-x:auto;padding:2px 2px 10px;scroll-snap-type:x proximity;margin:0 -16px;padding-left:16px;padding-right:16px}
+.offre{flex:none;width:210px;background:var(--card);border:1px solid var(--bord);border-radius:18px;overflow:hidden;text-decoration:none;box-shadow:var(--ombre);scroll-snap-align:start}
+.offre .im{height:110px;background:linear-gradient(135deg,rgba(19,163,85,.22),rgba(240,165,0,.18));display:grid;place-items:center;font-size:2.2rem;position:relative}
+.offre .im img{width:100%;height:100%;object-fit:cover}.offre .c{padding:10px 12px}.offre b{display:block;font-size:.95rem}
+.badge{position:absolute;top:8px;left:8px;background:var(--ambre);color:#2b1d00;font-weight:800;font-size:.72rem;padding:3px 9px;border-radius:999px}
+.pgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
+.pcarte{background:var(--card);border:1px solid var(--bord);border-radius:20px;overflow:hidden;text-decoration:none;box-shadow:var(--ombre);display:flex;flex-direction:column}
+.cover{height:118px;background:linear-gradient(135deg,var(--vert2),#054a21);display:grid;place-items:center;color:rgba(255,255,255,.9);font-size:2.4rem;font-weight:800;overflow:hidden}
+.cover img{width:100%;height:100%;object-fit:cover}.pcarte .c{padding:12px 14px 14px}.pcarte b{font-size:1.02rem}
+.puces{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.puce{background:var(--soft);color:var(--vert);padding:2px 9px;border-radius:999px;font-size:.75rem;font-weight:700}
+.puce.ambre{background:rgba(240,165,0,.16);color:#a87400}
+.art{display:flex;gap:12px;align-items:center;background:var(--card);border:1px solid var(--bord);border-radius:18px;padding:12px;margin-bottom:10px;box-shadow:var(--ombre)}
+.art .im{width:86px;height:86px;border-radius:14px;flex:none;background:linear-gradient(135deg,rgba(19,163,85,.2),rgba(240,165,0,.14));display:grid;place-items:center;font-size:1.9rem;overflow:hidden;position:relative}
+.art .im img{width:100%;height:100%;object-fit:cover}.art .corps{flex:1;min-width:0}.art b{display:block}
+@media(max-width:430px){.art .im{width:72px;height:72px}.art{gap:10px;padding:10px}.qte button{width:34px;height:34px}}
+.prix{font-weight:800;color:var(--vert);font-size:1.02rem}.prix s{color:var(--mut);font-weight:500;font-size:.85rem;margin-left:6px}
+.qte{display:flex;align-items:center;gap:8px}.qte button{width:36px;height:36px;border-radius:50%;border:1.5px solid var(--vert);background:transparent;color:var(--vert);font-size:1.3rem;cursor:pointer;line-height:1}
+.qte span{min-width:20px;text-align:center;font-weight:800}
+.chips{position:sticky;top:0;z-index:10;background:var(--bg);padding:10px 0;display:flex;gap:8px;overflow-x:auto;margin-bottom:6px}
+.chips a{flex:none;text-decoration:none;background:var(--card);border:1px solid var(--bord);padding:7px 14px;border-radius:999px;font-size:.88rem;font-weight:650}
+.rubrique{font-size:.78rem;text-transform:uppercase;letter-spacing:.09em;color:var(--mut);font-weight:800;margin:20px 0 10px;scroll-margin-top:60px}
+.filtre{width:100%;padding:12px 16px;border-radius:999px;border:1px solid var(--bord);background:var(--card);color:var(--txt);font-size:1rem;margin-bottom:6px;font-family:inherit}
+#bar{display:none;position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--bord);padding:12px 16px calc(12px + env(safe-area-inset-bottom,0px));justify-content:space-between;align-items:center;gap:10px;box-shadow:0 -8px 26px rgba(0,0,0,.14);z-index:20}
+.btn{background:linear-gradient(135deg,var(--vert2),var(--vert));color:#fff;border-radius:999px;padding:12px 20px;text-decoration:none;font-weight:800;border:0;font-family:inherit;font-size:.95rem;cursor:pointer;display:inline-block}
+.btn.sec{background:transparent;color:var(--vert);border:1.5px solid var(--vert)}
+.vide{text-align:center;color:var(--mut);padding:30px 10px}
+.pied{text-align:center;color:var(--mut);font-size:.8rem;padding:10px 0 30px}
+.ident{display:flex;align-items:center;gap:14px;margin-top:14px}.ident h1.titre{margin:0}
+.logo-p{width:68px;height:68px;border-radius:20px;object-fit:cover;background:#fff;color:var(--vert);display:grid;place-items:center;font-weight:800;font-size:1.7rem;border:3px solid #fff;box-shadow:0 6px 18px rgba(0,0,0,.25);flex:none;text-decoration:none}
+.pcarte .c{position:relative}.mini-logo{position:absolute;top:-30px;right:12px;width:52px;height:52px;border-radius:15px;object-fit:cover;border:3px solid var(--card);background:#fff;box-shadow:var(--ombre)}
+.reste{color:#a87400;font-size:.8rem;font-weight:700}
+</style>"""
+
+SHOP_MACROS = """
+{% macro carte_part(p) %}<a class="pcarte" href="{{ url_for('boutique_partenaire', id=p.id) }}"><div class="cover">{% if p.photo %}<img src="{{ url_for('photo', nom=p.photo) }}" alt="" loading="lazy">{% else %}{{ initiale(p.nom) }}{% endif %}</div>
+<div class="c">{% if p.logo %}<img class="mini-logo" src="{{ url_for('photo', nom=p.logo) }}" alt="" loading="lazy">{% endif %}<b>{{ p.nom }}</b><div class="mut">{{ p.categorie }}{% if p.categorie and p.quartier %} · {% endif %}{{ p.quartier }}</div>
+{% if p.description %}<div class="mut" style="margin-top:4px">{{ p.description }}</div>{% endif %}
+<div class="puces">{% if p.note %}<span class="puce ambre">★ {{ p.note }} ({{ p.nb_avis }})</span>{% endif %}<span class="puce">{{ p.n }} article{{ 's' if p.n > 1 }}</span></div></div></a>{% endmacro %}
+{% macro carte_offre(a) %}<a class="offre" href="{{ url_for('boutique_partenaire', id=a.partenaire_id) }}#a{{ a.id }}"><div class="im">{% if a.photo %}<img src="{{ url_for('photo', nom=a.photo) }}" alt="" loading="lazy">{% else %}🍽️{% endif %}
+{% if promo_active(a) %}<span class="badge">−{{ pct_promo(a) }} %</span>{% endif %}</div>
+<div class="c"><b>{{ a.nom }}</b><div class="mut">{{ a.pnom }}</div><div class="prix">{{ prix_effectif(a)|fcfa }} F{% if promo_active(a) %}<s>{{ a.prix|fcfa }}</s>{% endif %}</div></div></a>{% endmacro %}
+"""
+
+PAGE_BOUTIQUE = """<!doctype html><html lang="fr"><head><title>{{ nom }} · Boutique</title>""" + SHOP_CSS + """</head><body>""" + SHOP_MACROS + """
+<header class="hero"><div class="wrap"><div class="marque"><span class="t">🏍️ {{ nom }}</span><span class="mut" style="color:#d5eadc">Livraison à domicile</span></div>
+<h1 class="titre">Tout le marché,<br>livré chez vous.</h1><p>Choisissez chez nos partenaires. Un livreur récupère votre commande et vous l'apporte.</p>
+<form class="recherche" method="get"><input name="q" value="{{ q }}" placeholder="Plat, produit, commerce…" autocomplete="off"><button>Chercher</button></form></div></header>
+<main class="wrap">
+{% if q %}
+<section><h2 class="s">Résultats pour « {{ q }} »<a href="{{ url_for('boutique') }}">Tout voir</a></h2>
+{% if res.parts %}<div class="pgrid" style="margin-bottom:18px">{% for p in res.parts %}{{ carte_part(p) }}{% endfor %}</div>{% endif %}
+{% for a in res.articles %}<a class="art" href="{{ url_for('boutique_partenaire', id=a.partenaire_id) }}#a{{ a.id }}" style="text-decoration:none">
+<div class="im">{% if a.photo %}<img src="{{ url_for('photo', nom=a.photo) }}" alt="" loading="lazy">{% else %}🍽️{% endif %}</div>
+<div class="corps"><b>{{ a.nom }}</b><div class="mut">chez {{ a.pnom }}</div><div class="prix">{{ prix_effectif(a)|fcfa }} F{% if promo_active(a) %}<s>{{ a.prix|fcfa }}</s>{% endif %}</div></div></a>{% endfor %}
+{% if not res.parts and not res.articles %}<p class="vide">Rien trouvé pour cette recherche. Essayez un autre mot, ou parcourez les rayons.</p>{% endif %}</section>
+{% else %}
+{% if rayons %}<section><h2 class="s">Rayons</h2><div class="rayons">{% for r in rayons %}<a class="rayon" href="{{ url_for('boutique_rayon', id=r.id) }}"><span class="ico">{{ r.emoji }}</span><b>{{ r.nom }}</b><small>{{ r.n }} partenaire{{ 's' if r.n > 1 }}</small></a>{% endfor %}</div></section>{% endif %}
+{% if offres %}<section><h2 class="s">🔥 Offres du moment</h2><div class="offres">{% for a in offres %}{{ carte_offre(a) }}{% endfor %}</div></section>{% endif %}
+<section><h2 class="s">Nos partenaires</h2><div class="pgrid">{% for p in parts %}{{ carte_part(p) }}{% else %}<p class="vide" style="grid-column:1/-1">La boutique ouvre bientôt. Revenez vite !</p>{% endfor %}</div></section>
+{% endif %}
+<p class="pied">{{ nom }} · livraison à domicile</p></main></body></html>"""
+
+PAGE_BOUTIQUE_RAYON = """<!doctype html><html lang="fr"><head><title>{{ r.nom }} · {{ nom }}</title>""" + SHOP_CSS + """</head><body>""" + SHOP_MACROS + """
+<header class="hero petit"><div class="wrap"><a href="{{ url_for('boutique') }}">← Tous les rayons</a>
+<h1 class="titre" style="margin-top:14px">{{ r.emoji }} {{ r.nom }}</h1><p>{{ r.description }}</p></div></header>
+<main class="wrap">
+{% if offres %}<section><h2 class="s">🔥 À découvrir</h2><div class="offres">{% for a in offres %}{{ carte_offre(a) }}{% endfor %}</div></section>{% endif %}
+<section><h2 class="s">Les partenaires</h2><div class="pgrid">{% for p in parts %}{{ carte_part(p) }}{% else %}<p class="vide" style="grid-column:1/-1">Pas encore de partenaire dans ce rayon.</p>{% endfor %}</div></section>
+</main></body></html>"""
+
+PAGE_BOUTIQUE_PART = """<!doctype html><html lang="fr"><head><title>{{ p.nom }} · {{ nom }}</title>""" + SHOP_CSS + """</head><body>
+<header class="hero petit"{% if p.photo %} style="background:linear-gradient(180deg,rgba(0,0,0,.30),rgba(5,74,33,.93)),url('{{ url_for('photo', nom=p.photo) }}') center/cover"{% endif %}><div class="wrap"><a href="{{ retour }}">← Retour</a>
+<div class="ident">{% if p.logo %}<img class="logo-p" src="{{ url_for('photo', nom=p.logo) }}" alt="Logo {{ p.nom }}">{% else %}<span class="logo-p">{{ initiale(p.nom) }}</span>{% endif %}<h1 class="titre">{{ p.nom }}</h1></div>
+<p>{{ p.categorie }}{% if p.categorie and p.quartier %} · {% endif %}{{ p.quartier }}{% if note %} · ★ {{ note }} ({{ nb_avis }} avis){% endif %}</p>
+{% if p.description %}<p style="margin-top:6px">{{ p.description }}</p>{% endif %}</div></header>
+<main class="wrap">
+{% if articles %}<input class="filtre" id="filtre" placeholder="Chercher dans {{ p.nom }}…" oninput="filtrer()" autocomplete="off">
+{% if groupes|length > 1 %}<div class="chips">{% for g in groupes %}<a href="#r{{ loop.index }}">{{ g.nom or 'Autres' }}</a>{% endfor %}</div>{% endif %}{% endif %}
+{% for g in groupes %}<div class="rubrique" id="r{{ loop.index }}">{{ g.nom or ('Articles' if groupes|length == 1 else 'Autres') }}</div>
+{% for a in g.articles %}<div class="art" id="a{{ a.id }}" data-t="{{ (a.nom ~ ' ' ~ a.description)|lower }}"><div class="im">{% if a.photo %}<img src="{{ url_for('photo', nom=a.photo) }}" alt="" loading="lazy">{% else %}🍽️{% endif %}
+{% if promo_active(a) %}<span class="badge">−{{ pct_promo(a) }} %</span>{% endif %}</div>
+<div class="corps"><b>{{ a.nom }}</b>{% if a.description %}<div class="mut">{{ a.description }}</div>{% endif %}<div class="prix">{{ prix_effectif(a)|fcfa }} F{% if promo_active(a) %}<s>{{ a.prix|fcfa }}</s>{% endif %}</div>{% if a.suivi_stock and a.stock <= (a.seuil_alerte or 3) %}<div class="reste">Plus que {{ a.stock|qte }} en stock</div>{% endif %}</div>
+{% if numero %}<div class="qte"><button type="button" aria-label="Retirer" onclick="ajouter({{ a.id }}, -1)">−</button><span id="q{{ a.id }}">0</span><button type="button" aria-label="Ajouter" onclick="ajouter({{ a.id }}, 1)">+</button></div>{% endif %}</div>{% endfor %}
+{% else %}<p class="vide">Aucun article disponible pour le moment.</p>{% endfor %}
+{% if not numero %}<p class="vide">La commande en ligne sera bientôt disponible.</p>{% endif %}
+<p class="pied">{{ nom }} · livraison à domicile</p></main>
+{% if numero %}<div id="bar"><div><b id="tot"></b><div class="mut">+ frais de livraison</div></div><a class="btn" id="cmd" href="#">Commander sur WhatsApp</a></div>{% endif %}
+<script>
+const ART = {{ donnees|tojson }}, NUM = {{ numero|tojson }}, PART = {{ p.nom|tojson }}, qte = {};
+function maj() {
+  let n = 0, t = 0, l = [];
+  ART.forEach(a => { const q = qte[a.id] || 0, el = document.getElementById('q' + a.id); if (el) el.textContent = q; if (q) { n += q; t += q * a.prix; l.push('- ' + q + ' x ' + a.nom); } });
+  const bar = document.getElementById('bar'); if (!bar) return;
+  bar.style.display = n ? 'flex' : 'none';
+  document.getElementById('tot').textContent = n + ' article' + (n > 1 ? 's' : '') + ' · ' + t.toLocaleString('fr-FR') + ' F';
+  const msg = 'Bonjour, je souhaite commander chez ' + PART + ' :\\n' + l.join('\\n') + '\\nLivraison à (quartier et repère) : ';
+  document.getElementById('cmd').href = 'https://wa.me/' + NUM + '?text=' + encodeURIComponent(msg);
+}
+function ajouter(id, d) { qte[id] = Math.max(0, (qte[id] || 0) + d); maj(); }
+function filtrer() {
+  const v = document.getElementById('filtre').value.toLowerCase().trim();
+  document.querySelectorAll('.art').forEach(e => { e.style.display = (!v || e.dataset.t.includes(v)) ? '' : 'none'; });
+}
+</script></body></html>"""
+
+
+def _cartes_partenaires(rayon_id=None):
+    with db() as con:
+        sql = ("SELECT p.*, (SELECT COUNT(*) FROM articles a WHERE a.partenaire_id=p.id AND a.dispo=1 AND (COALESCE(a.suivi_stock,0)=0 OR COALESCE(a.stock,0)>0)) AS n "
+               "FROM partenaires p WHERE p.actif=1")
+        args = []
+        if rayon_id is not None:
+            sql += " AND p.rayon_id=?"
+            args.append(rayon_id)
+        lignes = con.execute(sql + " ORDER BY p.nom", args).fetchall()
+    sortie = []
+    for p in lignes:
+        if p["n"]:
+            note, nb = note_partenaire(p["id"])
+            sortie.append(dict(p, note=note, nb_avis=nb))
+    return sortie
+
+
+def _offres(rayon_id=None, limite=10):
+    with db() as con:
+        lignes = con.execute("SELECT a.*, p.nom AS pnom, p.rayon_id AS prayon FROM articles a JOIN partenaires p ON p.id=a.partenaire_id "
+                             "WHERE a.dispo=1 AND p.actif=1 AND (COALESCE(a.suivi_stock,0)=0 OR COALESCE(a.stock,0)>0)").fetchall()
+    choisies = [dict(a) for a in lignes if (a["vedette"] or promo_active(a)) and (rayon_id is None or a["prayon"] == rayon_id)]
+    choisies.sort(key=lambda a: (not promo_active(a), -a["id"]))
+    return choisies[:limite]
+
+
+def _recherche_boutique(q):
+    mots = _cle(q).split()
+    if not mots:
+        return {"parts": [], "articles": []}
+    with db() as con:
+        arts = con.execute("SELECT a.*, p.nom AS pnom FROM articles a JOIN partenaires p ON p.id=a.partenaire_id "
+                           "WHERE a.dispo=1 AND p.actif=1 AND (COALESCE(a.suivi_stock,0)=0 OR COALESCE(a.stock,0)>0)").fetchall()
+    trouves_a = [dict(a) for a in arts if all(m in _cle(f"{a['nom']} {a['description']} {a['rubrique']} {a['pnom']}") for m in mots)]
+    trouves_p = [p for p in _cartes_partenaires()
+                 if all(m in _cle(f"{p['nom']} {p['categorie']} {p['quartier']} {p['alias']}") for m in mots)]
+    return {"parts": trouves_p[:6], "articles": trouves_a[:20]}
+
+
+@app.route("/boutique")
+def boutique():
+    q = request.args.get("q", "").strip()[:60]
+    nom = nom_entreprise()
+    if q:
+        return render_template_string(PAGE_BOUTIQUE, q=q, res=_recherche_boutique(q), nom=nom, rayons=[], offres=[], parts=[])
+    rayons = []
+    for r in liste_rayons():
+        n = len(_cartes_partenaires(r["id"]))
+        if n:
+            rayons.append(dict(r, n=n))
+    return render_template_string(PAGE_BOUTIQUE, q="", res=None, nom=nom, rayons=rayons, offres=_offres(), parts=_cartes_partenaires())
+
+
+@app.route("/boutique/rayon/<int:id>")
+def boutique_rayon(id):
+    with db() as con:
+        r = con.execute("SELECT * FROM rayons WHERE id=? AND actif=1", (id,)).fetchone()
+    if not r:
+        abort(404)
+    return render_template_string(PAGE_BOUTIQUE_RAYON, r=r, parts=_cartes_partenaires(id), offres=_offres(id), nom=nom_entreprise())
+
+
+@app.route("/boutique/<int:id>")
+def boutique_partenaire(id):
+    with db() as con:
+        p = con.execute("SELECT * FROM partenaires WHERE id=? AND actif=1", (id,)).fetchone()
+        articles = con.execute("SELECT * FROM articles a WHERE partenaire_id=? AND dispo=1 AND (COALESCE(a.suivi_stock,0)=0 OR COALESCE(a.stock,0)>0) ORDER BY id", (id,)).fetchall() if p else []
+    if not p:
+        abort(404)
+    ordre = {}  # rubriques dans l'ordre où le partenaire les a créées ; dans chaque rubrique, les articles mis en avant d'abord
+    for a in articles:
+        ordre.setdefault(a["rubrique"] or "", []).append(a)
+    groupes = [{"nom": nom, "articles": sorted(liste, key=lambda x: (not x["vedette"], x["id"]))} for nom, liste in ordre.items()]
+    articles = [a for g in groupes for a in g["articles"]]
+    numero = tel_wa(os.environ.get("WA_NUMERO_PUBLIC", ""))  # chiffres seuls, avec 226 si le numéro a 8 chiffres
+    donnees = [{"id": a["id"], "nom": a["nom"], "prix": prix_effectif(a)} for a in articles]
+    note, nb = note_partenaire(id)
+    retour = url_for("boutique_rayon", id=p["rayon_id"]) if p["rayon_id"] and request.referrer and "/boutique/rayon/" in request.referrer else url_for("boutique")
+    return render_template_string(PAGE_BOUTIQUE_PART, p=p, articles=articles, groupes=groupes, donnees=donnees, numero=numero,
+                                  nom=nom_entreprise(), note=note, nb_avis=nb, retour=retour)
+
+
+# ---------- espace PARTENAIRE : le côté « marché » ----------
+ESPACE_HAUT = """<!doctype html><html lang="fr"><head><title>{{ p.nom }} · Espace partenaire</title>""" + SHOP_CSS + """
+<meta name="robots" content="noindex,nofollow"><style>
+.onglets{position:fixed;left:0;right:0;bottom:0;display:flex;overflow-x:auto;background:var(--card);border-top:1px solid var(--bord);padding:6px 6px calc(6px + env(safe-area-inset-bottom,0px));z-index:30;box-shadow:0 -6px 20px rgba(0,0,0,.08)}
+.onglets a{flex:1 0 64px;text-align:center;text-decoration:none;font-size:.72rem;color:var(--mut);padding:6px 2px;border-radius:12px;font-weight:650}
+.onglets a i{display:block;font-style:normal;font-size:1.3rem}.onglets a.on{color:var(--vert);background:var(--soft)}
+.kp{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:20px}
+.kp div{background:var(--card);border:1px solid var(--bord);border-radius:16px;padding:12px 14px;box-shadow:var(--ombre)}.kp b{display:block;font-size:1.35rem;letter-spacing:-.02em}.kp span{color:var(--mut);font-size:.8rem}
+.cmd{background:var(--card);border:1px solid var(--bord);border-radius:18px;padding:14px;margin-bottom:12px;box-shadow:var(--ombre)}
+.cmd .t{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.cmd ul{margin:8px 0;padding-left:18px}
+.cmd.prete{border-color:var(--vert2)}.msgok{background:var(--soft);border:1px solid var(--vert2);border-radius:14px;padding:10px 14px;margin-bottom:14px;font-weight:650}
+.f label{display:block;font-size:.78rem;color:var(--mut);margin:10px 0 4px;font-weight:650}.f input,.f select{width:100%;padding:10px 12px;border:1px solid var(--bord);border-radius:10px;font-size:1rem;background:var(--card);color:var(--txt);font-family:inherit}
+.f .g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:0 12px}
+.carte{background:var(--card);border:1px solid var(--bord);border-radius:18px;padding:14px;margin-bottom:12px;box-shadow:var(--ombre)}
+table{width:100%;border-collapse:collapse;font-size:.88rem}th,td{padding:9px 6px;border-bottom:1px solid var(--bord);text-align:left}th{color:var(--mut);font-size:.72rem;text-transform:uppercase}
+</style></head><body>
+<header class="hero petit"><div class="wrap"><div class="marque"><span class="t">🏪 Espace partenaire</span><span class="mut" style="color:#d5eadc">{{ nom }}</span></div>
+<div class="ident">{% if p.logo %}<img class="logo-p" src="{{ url_for('photo', nom=p.logo) }}" alt="">{% else %}<a class="logo-p" href="{{ url_for('espace_compte') }}" title="Ajouter mon logo">{{ initiale(p.nom) }}</a>{% endif %}<h1 class="titre" style="font-size:clamp(1.5rem,5vw,2.1rem);margin:0">{{ p.nom }}</h1></div>
+<p>{% if note %}★ {{ note }} ({{ nb_avis }} avis) · {% endif %}{{ p.quartier }}</p><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><a class="btn" href="{{ url_for('boutique_partenaire', id=p.id) }}" target="_blank">👁 Voir ma boutique comme un client</a><a class="btn sec" href="{{ url_for('espace_compte') }}">⚙ Mon profil et mon compte</a><form method="post" action="{{ url_for('deconnexion') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><button class="btn sec">Déconnexion</button></form></div></div></header>
+<main class="wrap">{% if msg %}<div class="msgok">{{ msg }}</div>{% endif %}
+"""
+ESPACE_BAS = """</main>
+<nav class="onglets"><a class="{{ 'on' if onglet == 'commandes' }}" href="{{ url_for('espace') }}"><i>📋</i>Commandes</a>
+<a class="{{ 'on' if onglet == 'caisse' }}" href="{{ url_for('espace_caisse') }}"><i>🧾</i>Caisse</a>
+<a class="{{ 'on' if onglet == 'stock' }}" href="{{ url_for('espace_stock') }}"><i>🏬</i>Magasin</a>
+<a class="{{ 'on' if onglet == 'catalogue' }}" href="{{ url_for('espace_catalogue') }}"><i>📦</i>Catalogue</a>
+<a class="{{ 'on' if onglet == 'factures' }}" href="{{ url_for('espace_factures') }}"><i>📄</i>Factures</a>
+<a class="{{ 'on' if onglet == 'releve' }}" href="{{ url_for('espace_releve') }}"><i>💰</i>Mon relevé</a>
+<a class="{{ 'on' if onglet == 'compte' }}" href="{{ url_for('espace_compte') }}"><i>⚙️</i>Mon compte</a></nav>
+""" + str(SCRIPT_PHOTOS) + "</body></html>"
+
+PAGE_ESPACE = ESPACE_HAUT + """
+<div class="kp"><div><b>{{ a_preparer }}</b><span>à préparer</span></div><div><b>{{ mois.ventes|fcfa }} F</b><span>ventes du mois</span></div>
+<div><b>{{ mois.net|fcfa }} F</b><span>vous reviennent ce mois</span></div>
+<div><b>{{ (tout.solde if tout.solde >= 0 else -tout.solde)|fcfa }} F</b><span>{% if tout.solde > 0 %}{{ nom }} vous doit{% elif tout.solde < 0 %}vous devez à {{ nom }}{% else %}comptes à jour{% endif %}</span></div></div>
+<h2 class="s">Commandes en cours</h2>
+{% for c in en_cours %}<div class="cmd {{ 'prete' if c.l.prete_le }}"><div class="t"><div><b>{{ c.l.numero }}</b> · {{ (c.l.cree_le or '')[11:16] }}<div class="mut">{{ (c.l.client_nom or '').split(' ')[0] }}</div></div>
+<span class="puce {{ '' if c.l.prete_le else 'ambre' }}">{% if c.l.statut == 'collecté' %}🏍️ Récupérée{% elif c.l.prete_le %}✅ Prête{% else %}⏳ À préparer{% endif %}</span></div>
+<ul>{% for r in c.lignes %}<li>{{ r.quantite }} × {{ r.nom }}</li>{% else %}<li>{{ c.l.colis }}</li>{% endfor %}</ul>
+<div class="mut">Total articles : <b>{{ c.l.valeur_produit|fcfa }} F</b>{% if c.l.livreur %} · Livreur : {{ c.l.livreur }}{% endif %}</div>
+{% if c.l.statut == 'en attente' and not c.l.prete_le %}<form method="post" action="{{ url_for('espace_prete', id=c.l.id) }}" style="margin-top:10px"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><button class="btn">✅ La commande est prête</button></form>{% endif %}</div>
+{% else %}<p class="vide">Aucune commande en cours. Vous serez prévenu ici dès qu'un client commande.</p>{% endfor %}
+<h2 class="s" style="margin-top:24px">Dernières livrées</h2>
+{% for l in livrees %}<div class="carte" style="display:flex;justify-content:space-between;gap:10px"><div><b>{{ l.numero }}</b> · {{ (l.heure_livraison or l.cree_le or '')[:10] }}<div class="mut">{{ l.colis }}</div></div><b>{{ l.valeur_produit|fcfa }} F</b></div>
+{% else %}<p class="vide">Pas encore de commande livrée.</p>{% endfor %}
+<p class="pied">Actualisez la page pour voir les nouvelles commandes.</p>""" + ESPACE_BAS
+
+PAGE_ESPACE_CATALOGUE = ESPACE_HAUT + """
+<h2 class="s">Mon catalogue</h2><p class="mut">Rendez un article indisponible quand il est épuisé, changez un prix, lancez une promotion. Les changements sont immédiats dans la boutique.</p>
+<datalist id="rubs">{% for r in rubriques_partenaire(p.id) %}<option value="{{ r }}">{% endfor %}</datalist>
+{% for a in articles %}<form class="carte f" method="post" action="{{ url_for('espace_modifier_article', aid=a.id) }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><b>{{ a.nom }}</b>
+{% if promo_active(a) %}<span class="puce ambre">promo −{{ pct_promo(a) }} %</span>{% endif %}{% if a.suivi_stock %} <span class="puce {{ 'ambre' if a.stock <= a.seuil_alerte else '' }}">stock : {{ a.stock|qte }}</span>{% endif %}
+<div class="g"><div><label>Prix (FCFA)</label><input name="prix" value="{{ a.prix|int }}" inputmode="numeric"></div>
+<div><label>Prix promo</label><input name="promo_prix" value="{{ a.promo_prix|int if a.promo_prix else '' }}" inputmode="numeric" placeholder="aucun"></div>
+<div><label>Fin de la promo</label><input type="date" name="promo_fin" value="{{ a.promo_fin }}"></div></div>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px"><label style="margin:0;display:flex;gap:8px;align-items:center;color:var(--txt);font-size:.95rem"><input type="checkbox" name="dispo" value="1" style="width:auto" {{ 'checked' if a.dispo }}> disponible</label><button class="btn">Enregistrer</button></div></form>
+{% else %}<p class="vide">Aucun article pour le moment.</p>{% endfor %}
+<form class="carte f" method="post" action="{{ url_for('espace_ajouter_article') }}" enctype="multipart/form-data"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><b>➕ Ajouter un article</b>
+<div class="g"><div><label>Nom</label><input name="nom" required></div><div><label>Prix (FCFA)</label><input name="prix" required inputmode="numeric"></div>
+<div><label>Rubrique</label><input name="rubrique" list="rubs" placeholder="ex : Plats"></div></div>
+<label>Description (facultatif)</label><input name="description"><label>Photo (facultatif)</label><input type="file" name="photo" accept="image/*">
+<div style="margin-top:12px"><button class="btn">Ajouter</button></div></form>""" + ESPACE_BAS
+
+PAGE_ESPACE_RELEVE = ESPACE_HAUT + """
+<h2 class="s">Relevé {{ mois }}</h2>
+<div class="kp"><div><b>{{ b.nb }}</b><span>commandes livrées</span></div><div><b>{{ b.ventes|fcfa }} F</b><span>articles vendus</span></div>
+<div><b>{{ b.commission|fcfa }} F</b><span>commission {{ nom }}</span></div><div><b>{{ b.net|fcfa }} F</b><span>vous reviennent</span></div></div>
+<div class="carte" style="overflow-x:auto"><table><tr><th>Date</th><th>Commande</th><th>Ventes</th><th>Commission</th></tr>
+{% for l, ventes, com, net, effet in b.detail %}<tr><td>{{ (l.heure_livraison or l.cree_le or '')[:10] }}</td><td>{{ l.numero }}</td><td>{{ ventes|fcfa }} F</td><td>{{ com|fcfa }} F</td></tr>
+{% else %}<tr><td colspan="4" class="mut">Aucune commande livrée ce mois-ci.</td></tr>{% endfor %}</table></div>
+<p><b>Solde actuel :</b> {% if tout.solde > 0 %}{{ nom }} vous doit {{ tout.solde|fcfa }} F{% elif tout.solde < 0 %}vous devez {{ (-tout.solde)|fcfa }} F à {{ nom }}{% else %}comptes à jour{% endif %}.</p>
+<form method="get" class="f"><label>Autre mois</label><input type="month" name="mois" value="{{ mois }}" onchange="this.form.submit()" style="max-width:220px"></form>""" + ESPACE_BAS
+
+
+PAGE_PORTAIL_LIVREUR = """<!doctype html><html lang="fr"><head><title>{{ nom }} · Espace livreur</title>""" + SHOP_CSS + """
+<meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer"><style>
+.dl-wrap{max-width:900px}.dl-kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:0 0 18px}.dl-kpi{background:var(--card);border:1px solid var(--bord);border-radius:16px;padding:13px;box-shadow:var(--ombre)}.dl-kpi b{display:block;font-size:1.35rem}.dl-kpi span{color:var(--mut);font-size:.8rem}.dl-job{background:var(--card);border:1px solid var(--bord);border-radius:18px;padding:16px;margin-bottom:12px;box-shadow:var(--ombre)}.dl-job-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap}.dl-job h2{margin:0 0 4px}.dl-state{display:inline-block;padding:4px 10px;border-radius:999px;background:var(--soft);color:var(--vert);font-size:.78rem;font-weight:750}.dl-state.ambre{background:rgba(240,165,0,.16);color:#a87400}.dl-info{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:13px 0}.dl-box{padding:11px;border:1px solid var(--bord);border-radius:12px;background:var(--bg);min-width:0}.dl-box small{display:block;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);font-size:.68rem;font-weight:750;margin-bottom:4px}.dl-box b,.dl-box span{display:block;overflow-wrap:anywhere}.dl-box a{color:var(--vert);font-weight:700;text-decoration:none}.dl-items{margin:5px 0 0;padding-left:18px}.dl-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.dl-actions form{margin:0}.dl-actions button{width:100%}.dl-actions .btn{font-size:.88rem}.dl-issue{margin-top:12px}.dl-issue summary{cursor:pointer;color:var(--mut);font-weight:650}.dl-issue form{display:flex;gap:7px;align-items:end;margin-top:8px}.dl-issue form label{flex:1;margin:0}.dl-history{background:var(--card);border:1px solid var(--bord);border-radius:16px;padding:14px;margin:18px 0}.dl-history .fd-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--bord)}.dl-history .fd-row:last-child{border:0}.dl-flash{padding:11px 14px;border-radius:12px;background:var(--soft);border:1px solid var(--vert2);margin-bottom:14px;font-weight:650}
+@media(max-width:560px){.dl-wrap{padding:0 12px}.dl-kpis{gap:7px}.dl-kpi{padding:10px}.dl-kpi b{font-size:1.08rem}.dl-kpi span{font-size:.7rem}.dl-job{padding:12px}.dl-info{grid-template-columns:1fr}.dl-issue form{display:block}.dl-issue form button{margin-top:8px;width:100%}.dl-actions form,.dl-actions .btn{flex:1}}
+</style></head><body><header class="hero petit"><div class="wrap dl-wrap"><div class="marque"><span class="t">🏍️ Espace livreur</span><span>{{ nom }}</span></div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"><a class="btn sec" href="{{ url_for('portail_livreur_compte') }}">⚙ Mon profil et mon compte</a><form method="post" action="{{ url_for('deconnexion') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><button class="btn sec">Déconnexion</button></form></div><h1 class="titre" style="font-size:clamp(1.45rem,5vw,2rem);margin:15px 0 5px">Bonjour {{ livreur.nom }} 👋</h1><p>Voici uniquement les courses qui te sont confiées et les informations utiles pour les effectuer.</p></div></header>
+<main class="wrap dl-wrap">{% if msg %}<div class="dl-flash">{{ msg }}</div>{% endif %}
+<section class="dl-kpis"><div class="dl-kpi"><b>{{ en_cours|length }}</b><span>courses à suivre</span></div><div class="dl-kpi"><b>{{ resume.jour }}</b><span>livrées aujourd’hui</span></div><div class="dl-kpi"><b>{{ resume.semaine }}</b><span>livrées cette semaine</span></div></section>
+<p style="text-align:right;margin:-6px 0 14px"><button type="button" class="btn sec" onclick="location.reload()">🔄 Actualiser les courses</button></p>
+<h2 class="s">📍 Mes courses</h2>
+{% for c in courses %}{% set l = c.l %}<article class="dl-job"><div class="dl-job-head"><div><h2>{{ l.numero or ('LIV-' ~ '%04d'|format(l.id)) }}</h2><span class="mut">{{ l.cree_le or 'Date inconnue' }}</span></div><span class="dl-state {{ 'ambre' if l.statut != 'livré' else '' }}">{% if l.statut == 'en attente' %}À récupérer{% elif l.statut == 'collecté' %}En route{% elif l.statut == 'livré' %}Livrée · paiement à confirmer{% endif %}</span></div>
+<div class="dl-info"><div class="dl-box"><small>📦 Colis / commande</small><b>{{ l.colis or 'Livraison' }}</b>{% if c.articles %}<ul class="dl-items">{% for a in c.articles %}<li>{{ a.quantite }} × {{ a.nom }}</li>{% endfor %}</ul>{% endif %}</div><div class="dl-box"><small>📍 À récupérer</small><b>{{ l.collecte_lieu or 'Lieu à préciser' }}</b><span>{{ l.collecte_quartier or '' }}</span></div><div class="dl-box"><small>🏁 À livrer</small><b>{{ l.destinataire_nom or l.client_nom or 'Destinataire' }}</b><span>{{ l.livraison_adresse or '' }}{% if l.livraison_quartier %} · {{ l.livraison_quartier }}{% endif %}</span>{% if l.destinataire_tel or l.client_tel %}{% set tel = l.destinataire_tel or l.client_tel %}<a href="tel:{{ tel }}">📞 {{ tel }}</a>{% endif %}</div><div class="dl-box"><small>👤 Client / contact</small><b>{{ l.client_nom or 'Client' }}</b>{% if l.client_tel %}<a href="tel:{{ l.client_tel }}">📞 {{ l.client_tel }}</a>{% endif %}{% if l.remarques %}<span>Consigne : {{ l.remarques }}</span>{% endif %}</div></div>
+{% if l.prix_course or l.valeur_produit %}<div class="dl-box"><small>💰 Instruction de paiement</small>{% if l.prix_course %}<span>Course : <b>{{ l.prix_course|fcfa }} F</b> · {{ l.mode_paiement or 'mode à confirmer' }} · encaissement prévu par : <b>{{ l.encaisse_course_prevu or 'À préciser' }}</b>{% if l.statut_paiement == 'payé' %} · déjà réglée{% else %} · paiement à confirmer{% endif %}</span>{% endif %}{% if l.valeur_produit %}<span>Articles : {{ l.valeur_produit|fcfa }} F · suis la consigne convenue pour cette commande</span>{% endif %}</div>{% endif %}
+<div class="dl-actions">{% if l.statut == 'en attente' %}<form method="post" action="{{ url_for('portail_livreur_action', id=l.id, quoi='collecte') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><button>✅ Colis récupéré</button></form>{% elif l.statut == 'collecté' %}<form method="post" action="{{ url_for('portail_livreur_action', id=l.id, quoi='livre') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><button>🏁 Livraison effectuée</button></form>{% elif l.statut == 'livré' and l.statut_paiement != 'payé' %}<form method="post" action="{{ url_for('portail_livreur_action', id=l.id, quoi='paye') }}" onsubmit="return confirm('Confirmer que le paiement a bien été reçu ?')"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><button>💰 Confirmer le paiement reçu</button></form>{% endif %}</div>
+{% if l.statut in ('en attente','collecté') %}<details class="dl-issue"><summary>⚠️ Signaler un problème</summary><form method="post" action="{{ url_for('portail_livreur_action', id=l.id, quoi='probleme') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><label>Explique brièvement le problème<input name="note" maxlength="250" required placeholder="Client absent, adresse introuvable…"></label><button class="btn sec">Envoyer le signalement</button></form></details>{% endif %}</article>
+{% else %}<div class="dl-job vide">Aucune course en cours. Les nouvelles missions apparaîtront ici.</div>{% endfor %}
+<section class="dl-history"><h2 class="s">✅ Dernières livraisons terminées</h2>{% for l in historique %}<div class="fd-row"><span><b>{{ l.numero }}</b><br><small class="mut">{{ (l.heure_livraison or l.cree_le or '')[:16] }}</small></span><span class="dl-state">Terminée</span></div>{% else %}<p class="mut">Tes courses terminées apparaîtront ici.</p>{% endfor %}</section>
+<p class="pied">Besoin d’aide ? Contacte le responsable de l’équipe. Ne partage pas tes identifiants.</p></main></body></html>"""
+
+
+def reponse_portail(html):
+    reponse = app.make_response(html)
+    reponse.headers["Cache-Control"] = "no-store"
+    reponse.headers["Referrer-Policy"] = "no-referrer"
+    reponse.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return reponse
+
+
+PAGE_CONNEXION = """<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connexion · {{ nom }}</title>""" + SHOP_CSS + """
+<meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer"><style>
+.login-wrap{max-width:440px;margin:8vh auto;padding:0 16px}.login-card{background:var(--card);border:1px solid var(--bord);border-radius:22px;padding:24px;box-shadow:var(--ombre)}
+.login-card h1{margin:0 0 6px}.login-card p{color:var(--mut)}.login-card label{display:block;margin:16px 0 6px;font-weight:650}.login-card input{width:100%;padding:12px;border:1px solid var(--bord);border-radius:11px;font:inherit}.login-card button{width:100%;margin-top:16px}
+</style></head><body><main class="login-wrap"><section class="login-card"><div class="marque"><span class="t">🔐 Espace professionnel</span></div><h1>Connexion</h1><p>{{ nom }} · Partenaire ou livreur</p>{% if msg %}<p class="msgok">{{ msg }}</p>{% endif %}
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><label>Identifiant<input name="identifiant" autocomplete="username" required autofocus></label><label>Mot de passe<input type="password" name="mot_de_passe" autocomplete="current-password" required></label><button>Se connecter</button></form><p style="font-size:.82rem;margin-top:18px">Tu n’as pas encore reçu tes identifiants ? Contacte le responsable.</p></section></main></body></html>"""
+
+
+PAGE_COMPTE_LIVREUR = """<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mon compte livreur · {{ nom }}</title>""" + SHOP_CSS + """
+<meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer"><style>.acct{max-width:720px;margin:22px auto;padding:0 14px}.acct-card{background:var(--card);border:1px solid var(--bord);border-radius:18px;padding:18px;margin-bottom:14px;box-shadow:var(--ombre)}.acct-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.acct label{display:block;margin:10px 0;font-weight:650}.acct input{width:100%;padding:11px;border:1px solid var(--bord);border-radius:10px;font:inherit}.acct .wide{grid-column:1/-1}@media(max-width:560px){.acct-grid{grid-template-columns:1fr}.acct .wide{grid-column:auto}}</style></head><body>
+<header class="hero petit"><div class="wrap acct"><div class="marque"><span class="t">🏍️ Espace livreur</span><span>{{ nom }}</span></div><h1 class="titre" style="font-size:1.8rem;margin:14px 0 8px">Mon profil et mon compte</h1><div style="display:flex;gap:8px;flex-wrap:wrap"><a class="btn sec" href="{{ url_for('portail_livreur') }}">← Retour à mes courses</a><form method="post" action="{{ url_for('deconnexion') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><button class="btn sec">Déconnexion</button></form></div></div></header>
+<main class="acct">{% if msg %}<p class="msgok">{{ msg }}</p>{% endif %}<section class="acct-card"><h2>👤 Mon profil</h2><p class="mut">Tes coordonnées servent à te contacter et à préparer les affectations. Le responsable garde la gestion de ta disponibilité.</p><form method="post" action="{{ url_for('portail_modifier_compte') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><div class="acct-grid"><label>Nom affiché<input name="nom" value="{{ livreur.nom }}" required maxlength="100"></label><label>Téléphone<input name="tel" value="{{ livreur.tel }}" inputmode="tel"></label><label class="wide">Quartier de base<input name="base" value="{{ livreur.base }}" maxlength="120"></label></div>
+<h2 style="margin-top:22px">🔑 Identifiant et mot de passe</h2><label>Identifiant de connexion<input name="identifiant" value="{{ compte.identifiant }}" minlength="3" maxlength="40" pattern="[A-Za-z0-9._-]+" required autocomplete="username"></label><label>Mot de passe actuel<input type="password" name="mot_de_passe_actuel" maxlength="256" required autocomplete="current-password"></label><label>Nouveau mot de passe (laisser vide pour garder l’actuel)<input type="password" name="nouveau_mot_de_passe" minlength="12" maxlength="256" autocomplete="new-password"></label><label>Confirmer le nouveau mot de passe<input type="password" name="confirmation" minlength="12" maxlength="256" autocomplete="new-password"></label><button>Enregistrer mes changements</button></form></section></main></body></html>"""
+
+
+PAGE_COMPTE_PARTENAIRE = """<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mon compte partenaire · {{ nom }}</title>""" + SHOP_CSS + """
+<meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer"><style>.acct{max-width:760px;margin:22px auto;padding:0 14px}.acct-card{background:var(--card);border:1px solid var(--bord);border-radius:18px;padding:18px;margin-bottom:14px;box-shadow:var(--ombre)}.acct-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.acct label{display:block;margin:10px 0;font-weight:650}.acct input,.acct textarea{width:100%;padding:11px;border:1px solid var(--bord);border-radius:10px;font:inherit}.acct textarea{min-height:95px}.acct .wide{grid-column:1/-1}@media(max-width:560px){.acct-grid{grid-template-columns:1fr}.acct .wide{grid-column:auto}}</style></head><body>
+<header class="hero petit"><div class="wrap acct"><div class="marque"><span class="t">🏪 Espace partenaire</span><span>{{ nom }}</span></div><h1 class="titre" style="font-size:1.8rem;margin:14px 0 8px">Mon profil et mon compte</h1><div style="display:flex;gap:8px;flex-wrap:wrap"><a class="btn sec" href="{{ url_for('espace') }}">← Retour aux commandes</a><form method="post" action="{{ url_for('deconnexion') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><button class="btn sec">Déconnexion</button></form></div></div></header>
+<main class="acct">{% if msg %}<p class="msgok">{{ msg }}</p>{% endif %}<section class="acct-card"><h2>👤 Profil public</h2><p class="mut">Ces informations sont visibles dans la boutique. La commission, les versements et l’activation du compte restent gérés par le responsable.</p><form method="post" action="{{ url_for('portail_modifier_compte') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><div class="acct-grid"><label>Nom de la boutique<input name="nom" value="{{ p.nom }}" required maxlength="120"></label><label>Téléphone de contact<input name="tel" value="{{ p.tel }}" inputmode="tel"></label><label>Adresse<input name="adresse" value="{{ p.adresse }}" maxlength="180"></label><label>Quartier<input name="quartier" value="{{ p.quartier }}" maxlength="100"></label><label>Nom court / alias<input name="alias" value="{{ p.alias }}" maxlength="100"></label><label class="wide">Présentation<textarea name="description" maxlength="500">{{ p.description }}</textarea></label></div>
+<h2 style="margin-top:22px">🔑 Identifiant et mot de passe</h2><label>Identifiant de connexion<input name="identifiant" value="{{ compte.identifiant }}" minlength="3" maxlength="40" pattern="[A-Za-z0-9._-]+" required autocomplete="username"></label><label>Mot de passe actuel<input type="password" name="mot_de_passe_actuel" maxlength="256" required autocomplete="current-password"></label><label>Nouveau mot de passe (laisser vide pour garder l’actuel)<input type="password" name="nouveau_mot_de_passe" minlength="12" maxlength="256" autocomplete="new-password"></label><label>Confirmer le nouveau mot de passe<input type="password" name="confirmation" minlength="12" maxlength="256" autocomplete="new-password"></label><button>Enregistrer mes changements</button></form></section></main></body></html>"""
+
+
+def _identite_portail():
+    compte_id = session.get("compte_portail_id")
+    if not compte_id:
+        return None
+    with db() as con:
+        compte = con.execute("SELECT * FROM comptes_portail WHERE id=?", (compte_id,)).fetchone()
+        if not compte:
+            session.clear()
+            return None
+        if session.get("compte_version") != compte["version_session"]:
+            session.clear()
+            return None
+        table = "livreurs" if compte["role"] == "livreur" else "partenaires"
+        profil = con.execute(f"SELECT * FROM {table} WHERE id=? AND actif=1", (compte["profil_id"],)).fetchone()
+    if not profil:
+        session.clear()
+        return None
+    return {"compte": dict(compte), "profil": dict(profil), "role": compte["role"]}
+
+
+def _auth_portail(role):
+    identite = _identite_portail()
+    if not identite:
+        return None, redirect(url_for("connexion", msg="Connecte-toi pour ouvrir ton espace."))
+    if identite["role"] != role:
+        return None, abort(403)
+    return identite, None
+
+
+def _compte_apres_connexion(role):
+    return url_for("espace") if role == "partenaire" else url_for("portail_livreur")
+
+
+_ECHECS_CONNEXION = {}
+
+
+def _limite_tentatives_connexion(cle, echec=False, succes=False):
+    maintenant_monotone = time.monotonic()
+    for k, v in list(_ECHECS_CONNEXION.items()):
+        v = [t for t in v if maintenant_monotone - t < 900]
+        if v:
+            _ECHECS_CONNEXION[k] = v
+        else:
+            _ECHECS_CONNEXION.pop(k, None)
+    if succes:
+        _ECHECS_CONNEXION.pop(cle, None)
+        return False
+    essais = _ECHECS_CONNEXION.get(cle, [])
+    if len(essais) >= 8:
+        return True
+    if echec:
+        essais.append(maintenant_monotone)
+        _ECHECS_CONNEXION[cle] = essais
+        if len(_ECHECS_CONNEXION) > 3000:
+            _ECHECS_CONNEXION.pop(next(iter(_ECHECS_CONNEXION)))
+    return False
+
+
+@app.route("/connexion", methods=["GET", "POST"])
+def connexion():
+    identite = _identite_portail()
+    if identite and request.method == "GET":
+        return redirect(_compte_apres_connexion(identite["role"]))
+    msg = request.args.get("msg", "")[:200]
+    if request.method == "POST":
+        session.clear()
+        identifiant = request.form.get("identifiant", "").strip().lower()[:40]
+        mot_de_passe = request.form.get("mot_de_passe", "")
+        ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "inconnu"
+        cle_tentative = f"{ip[:80]}:{identifiant}"
+        if _limite_tentatives_connexion(cle_tentative):
+            msg = "Trop de tentatives. Réessaie dans 15 minutes."
+            return reponse_portail(render_template_string(PAGE_CONNEXION, nom=nom_entreprise(), msg=msg))
+        with db() as con:
+            compte = con.execute("SELECT * FROM comptes_portail WHERE identifiant=? COLLATE NOCASE", (identifiant,)).fetchone()
+            profil_actif = False
+            if compte:
+                table = "livreurs" if compte["role"] == "livreur" else "partenaires"
+                profil = con.execute(f"SELECT actif FROM {table} WHERE id=?", (compte["profil_id"],)).fetchone()
+                profil_actif = bool(profil and profil["actif"])
+        if not compte or len(mot_de_passe) > 256 or not check_password_hash(compte["mot_de_passe_hash"], mot_de_passe):
+            _limite_tentatives_connexion(cle_tentative, echec=True)
+            msg = "Identifiant ou mot de passe incorrect."
+        elif not profil_actif:
+            msg = "Ce compte est en pause. Contacte le responsable."
+        else:
+            _limite_tentatives_connexion(cle_tentative, succes=True)
+            session.clear()
+            session.permanent = True
+            session["compte_portail_id"] = compte["id"]
+            session["compte_version"] = compte["version_session"]
+            csrf_portail()
+            return redirect(_compte_apres_connexion(compte["role"]))
+    return reponse_portail(render_template_string(PAGE_CONNEXION, nom=nom_entreprise(), msg=msg))
+
+
+@app.route("/deconnexion", methods=["POST"])
+def deconnexion():
+    session.clear()
+    return redirect(url_for("connexion", msg="Tu es déconnecté."))
+
+
+@app.route("/portail-livreur")
+def portail_livreur():
+    identite, reponse = _auth_portail("livreur")
+    if reponse:
+        return reponse
+    livreur = identite["profil"]
+    debut_semaine, aujourdhui = lundi(date.today()).isoformat(), date.today().isoformat()
+    with db() as con:
+        lignes = con.execute("SELECT * FROM livraisons WHERE livreur=? AND (statut IN ('en attente','collecté') "
+                             "OR (statut='livré' AND statut_paiement!='payé')) ORDER BY id", (livreur["nom"],)).fetchall()
+        courses = [{"l": l, "articles": con.execute(
+            "SELECT nom, quantite FROM lignes_commande WHERE livraison_id=? ORDER BY id", (l["id"],)).fetchall()} for l in lignes]
+        historique = con.execute("SELECT numero, heure_livraison, cree_le FROM livraisons WHERE livreur=? "
+                                 "AND statut='livré' AND statut_paiement='payé' ORDER BY id DESC LIMIT 10",
+                                 (livreur["nom"],)).fetchall()
+        resume = con.execute("SELECT "
+                             "COALESCE(SUM(CASE WHEN statut='livré' AND date(COALESCE(NULLIF(heure_livraison,''),cree_le))=? THEN 1 ELSE 0 END),0) jour, "
+                             "COALESCE(SUM(CASE WHEN statut='livré' AND date(COALESCE(NULLIF(heure_livraison,''),cree_le))>=? THEN 1 ELSE 0 END),0) semaine "
+                             "FROM livraisons WHERE livreur=?", (aujourdhui, debut_semaine, livreur["nom"])).fetchone()
+    html = render_template_string(PAGE_PORTAIL_LIVREUR, livreur=livreur, nom=nom_entreprise(),
+                                  courses=courses, historique=historique, resume=resume,
+                                  msg=request.args.get("msg", "")[:200])
+    return reponse_portail(html)
+
+
+@app.route("/portail-livreur/action/<int:id>/<quoi>", methods=["POST"])
+def portail_livreur_action(id, quoi):
+    identite, reponse = _auth_portail("livreur")
+    if reponse:
+        return reponse
+    livreur = identite["profil"]
+    if quoi not in {"collecte", "livre", "paye", "probleme"}:
+        abort(404)
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=? AND livreur=?", (id, livreur["nom"])).fetchone()
+    if not l:
+        abort(404)
+    if quoi == "collecte" and l["statut"] == "en attente":
+        changer_statut(id, quoi, recu_par="livreur" if quoi == "paye" else "")
+        msg = "Course marquée comme récupérée."
+    elif quoi == "livre" and l["statut"] in ("en attente", "collecté"):
+        changer_statut(id, quoi, recu_par="livreur" if quoi == "paye" else "")
+        msg = "Livraison confirmée."
+    elif quoi == "paye" and l["statut"] == "livré" and l["statut_paiement"] != "payé":
+        changer_statut(id, quoi, recu_par="livreur" if quoi == "paye" else "")
+        msg = "Paiement marqué comme reçu."
+    elif quoi == "probleme" and l["statut"] in ("en attente", "collecté"):
+        note = request.form.get("note", "").strip()[:250]
+        if not note:
+            msg = "Décris le problème avant de l’envoyer."
+        else:
+            note_equipe = f"Problème signalé par {livreur['nom']} : {note}"
+            with db() as con:
+                ancienne = l["remarques"] or ""
+                remarque = ((ancienne + " | " if ancienne else "") + f"[{livreur['nom']}] {note}")[:1000]
+                con.execute("UPDATE livraisons SET remarques=? WHERE id=?",
+                            (remarque, id))
+            marquer(id, "a_verifier", note_equipe)
+            alerter_equipe(f"⚠️ {l['numero']} : {note_equipe}", id)
+            msg = "Signalement transmis au responsable."
+    else:
+        msg = "Cette action ne correspond plus à l’état de la course. Actualise la page."
+    return redirect(url_for("portail_livreur", msg=msg))
+
+
+def _contexte_espace(p, onglet, **extra):
+    note, nb = note_partenaire(p["id"])
+    return dict(p=p, onglet=onglet, note=note, nb_avis=nb, nom=nom_entreprise(), msg=request.args.get("msg", ""), **extra)
+
+
+@app.route("/espace")
+def espace():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    with db() as con:
+        encours = con.execute("SELECT * FROM livraisons WHERE partenaire_id=? AND statut IN ('en attente','collecté') ORDER BY id DESC", (p["id"],)).fetchall()
+        cmds = [{"l": l, "lignes": con.execute("SELECT nom, quantite FROM lignes_commande WHERE livraison_id=?", (l["id"],)).fetchall()} for l in encours]
+        livrees = con.execute("SELECT * FROM livraisons WHERE partenaire_id=? AND statut='livré' ORDER BY id DESC LIMIT 6", (p["id"],)).fetchall()
+    mois, tout = _bilan_complet(p["id"])
+    a_preparer = sum(1 for c in cmds if c["l"]["statut"] == "en attente" and not c["l"]["prete_le"])
+    return reponse_portail(render_template_string(
+        PAGE_ESPACE, **_contexte_espace(p, "commandes", en_cours=cmds, livrees=livrees,
+                                        mois=mois, tout=tout, a_preparer=a_preparer)))
+
+
+@app.route("/espace/prete/<int:id>", methods=["POST"])
+def espace_prete(id):
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    with db() as con:
+        l = con.execute("SELECT * FROM livraisons WHERE id=? AND partenaire_id=? AND statut='en attente'", (id, p["id"])).fetchone()
+        if l and not l["prete_le"]:
+            con.execute("UPDATE livraisons SET prete_le=? WHERE id=?", (maintenant(), id))
+        lv = con.execute("SELECT * FROM livreurs WHERE nom=?", (l["livreur"],)).fetchone() if l and l["livreur"] else None
+    if l and not l["prete_le"] and lv and lv["tel"]:
+        try:
+            envoyer(lv["tel"], f"✅ {p['nom']} : la commande {l['numero']} est prête. Tu peux passer la récupérer.", type_="prete", livraison_id=id)
+        except Exception:
+            log.exception("Livreur non prévenu pour %s", l["numero"])
+    return redirect(url_for("espace", msg="Merci ! Le livreur est prévenu." if l else "Commande introuvable."))
+
+
+@app.route("/espace/catalogue")
+def espace_catalogue():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    with db() as con:
+        articles = con.execute("SELECT * FROM articles WHERE partenaire_id=? ORDER BY dispo DESC, nom", (p["id"],)).fetchall()
+    return reponse_portail(render_template_string(
+        PAGE_ESPACE_CATALOGUE, **_contexte_espace(p, "catalogue", articles=articles)))
+
+
+@app.route("/espace/article/<int:aid>", methods=["POST"])
+def espace_modifier_article(aid):
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    d = _lire_article(dict(request.form, nom="x"))
+    if d["prix"] is None:
+        return redirect(url_for("espace_catalogue", msg="Prix invalide."))
+    with db() as con:
+        con.execute("UPDATE articles SET prix=?, promo_prix=?, promo_fin=?, dispo=? WHERE id=? AND partenaire_id=?",
+                    (d["prix"], d["promo_prix"], d["promo_fin"], 1 if request.form.get("dispo") else 0, aid, p["id"]))
+    return redirect(url_for("espace_catalogue", msg="Enregistré."))
+
+
+@app.route("/espace/article", methods=["POST"])
+def espace_ajouter_article():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    d = _lire_article(request.form)
+    if not d["nom"] or d["prix"] is None:
+        return redirect(url_for("espace_catalogue", msg="Il faut un nom et un prix valide."))
+    try:
+        ph = enregistrer_photo(request.files.get("photo"))
+    except ValueError as e:
+        return redirect(url_for("espace_catalogue", msg=str(e)))
+    with db() as con:
+        con.execute("INSERT INTO articles(partenaire_id, nom, description, rubrique, prix, photo, dispo, cree_le) VALUES (?,?,?,?,?,?,1,?)",
+                    (p["id"], d["nom"], d["description"], d["rubrique"], d["prix"], ph, maintenant()))
+    return redirect(url_for("espace_catalogue", msg=f"« {d['nom']} » ajouté."))
+
+
+@app.route("/espace/releve")
+def espace_releve():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    mois = request.args.get("mois", "")
+    if not re.fullmatch(r"\d{4}-\d{2}", mois):
+        mois = datetime.now().strftime("%Y-%m")
+    return reponse_portail(render_template_string(
+        PAGE_ESPACE_RELEVE, **_contexte_espace(p, "releve", b=bilan_partenaire(p["id"], mois),
+                                                tout=bilan_partenaire(p["id"]), mois=mois)))
+
+
+@app.route("/portail-livreur/compte")
+def portail_livreur_compte():
+    identite, reponse = _auth_portail("livreur")
+    if reponse:
+        return reponse
+    return reponse_portail(render_template_string(PAGE_COMPTE_LIVREUR, nom=nom_entreprise(),
+                                                   livreur=identite["profil"], compte=identite["compte"],
+                                                   msg=request.args.get("msg", "")[:200]))
+
+
+@app.route("/espace/compte")
+def espace_compte():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    return reponse_portail(render_template_string(PAGE_COMPTE_PARTENAIRE, nom=nom_entreprise(),
+                                                   p=identite["profil"], compte=identite["compte"],
+                                                   msg=request.args.get("msg", "")[:200]))
+
+
+@app.route("/compte/profil", methods=["POST"])
+def portail_modifier_compte():
+    identite = _identite_portail()
+    if not identite:
+        return redirect(url_for("connexion", msg="Connecte-toi pour modifier ton compte."))
+    compte = identite["compte"]
+    ancien_mdp = request.form.get("mot_de_passe_actuel", "")
+    if not check_password_hash(compte["mot_de_passe_hash"], ancien_mdp):
+        msg = "Mot de passe actuel incorrect."
+        return redirect(url_for("espace_compte" if identite["role"] == "partenaire" else "portail_livreur_compte", msg=msg))
+    identifiant = request.form.get("identifiant", "").strip().lower()
+    nouveau_mdp = request.form.get("nouveau_mot_de_passe", "")
+    confirmation = request.form.get("confirmation", "")
+    if not re.fullmatch(r"[a-z0-9._-]{3,40}", identifiant):
+        msg = "Identifiant invalide : 3 à 40 caractères, lettres, chiffres, point, tiret ou souligné."
+    elif nouveau_mdp and (len(nouveau_mdp) < 12 or len(nouveau_mdp) > 256):
+        msg = "Le nouveau mot de passe doit contenir de 12 à 256 caractères."
+    elif nouveau_mdp != confirmation:
+        msg = "Les deux nouveaux mots de passe ne correspondent pas."
+    else:
+        role, profil = identite["role"], identite["profil"]
+        try:
+            with db() as con:
+                if role == "livreur":
+                    nom = request.form.get("nom", "").strip()[:100]
+                    if not nom:
+                        return redirect(url_for("portail_livreur_compte", msg="Le nom ne peut pas être vide."))
+                    ancien_nom = profil["nom"]
+                    con.execute("UPDATE livreurs SET nom=?, tel=?, base=? WHERE id=?",
+                                (nom, chiffres(request.form.get("tel", "")), request.form.get("base", "").strip()[:120], profil["id"]))
+                    if nom != ancien_nom:
+                        con.execute("UPDATE livraisons SET livreur=? WHERE livreur=?", (nom, ancien_nom))
+                        con.execute("UPDATE avis SET livreur=? WHERE livreur=?", (nom, ancien_nom))
+                        con.execute("UPDATE paiements_livreurs SET livreur_nom=? WHERE livreur_id=?", (nom, profil["id"]))
+                else:
+                    nom = request.form.get("nom", "").strip()[:120]
+                    if not nom:
+                        return redirect(url_for("espace_compte", msg="Le nom de la boutique ne peut pas être vide."))
+                    con.execute("UPDATE partenaires SET nom=?, tel=?, adresse=?, quartier=?, alias=?, description=? WHERE id=?",
+                                (nom, chiffres(request.form.get("tel", "")), request.form.get("adresse", "").strip()[:180],
+                                 request.form.get("quartier", "").strip()[:100], request.form.get("alias", "").strip()[:100],
+                                 request.form.get("description", "").strip()[:500], profil["id"]))
+                if nouveau_mdp:
+                    con.execute("UPDATE comptes_portail SET identifiant=?, mot_de_passe_hash=?, version_session=version_session+1, modifie_le=? WHERE id=?",
+                                (identifiant, generate_password_hash(nouveau_mdp), maintenant(), compte["id"]))
+                else:
+                    con.execute("UPDATE comptes_portail SET identifiant=?, modifie_le=? WHERE id=?",
+                                (identifiant, maintenant(), compte["id"]))
+            if nouveau_mdp:
+                session["compte_version"] = compte["version_session"] + 1
+            msg = "Profil et compte mis à jour."
+        except sqlite3.IntegrityError:
+            msg = "Ce nom ou cet identifiant est déjà utilisé. Choisis-en un autre."
+    destination = "espace_compte" if identite["role"] == "partenaire" else "portail_livreur_compte"
+    return redirect(url_for(destination, msg=msg))
+
+
+@app.route("/espace/<path:ancien_lien>", methods=["GET", "POST"])
+def ancien_lien_partenaire(ancien_lien):
+    return redirect(url_for("connexion", msg="Les anciens liens privés ont été remplacés par des comptes. Connecte-toi avec ton identifiant."))
+
+
+@app.route("/portail-livreur/<path:ancien_lien>", methods=["GET", "POST"])
+def ancien_lien_livreur(ancien_lien):
+    return redirect(url_for("connexion", msg="Les anciens liens privés ont été remplacés par des comptes. Connecte-toi avec ton identifiant."))
+
+
+# =====================================================================================
+# v15 : livraisons du jour + carte en direct des livreurs, logo/photo des partenaires,
+#       magasin (stock), caisse et factures dans l'espace partenaire
+# =====================================================================================
+EXTRA_V15 = """
+CREATE TABLE IF NOT EXISTS positions_livreurs (
+  livreur_id INTEGER PRIMARY KEY, lat REAL NOT NULL, lon REAL NOT NULL, precision_m REAL DEFAULT 0,
+  vitesse REAL DEFAULT 0, cap REAL DEFAULT 0, maj_ts REAL NOT NULL, maj_le TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS trace_livreurs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, livreur_id INTEGER NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
+  ts REAL NOT NULL, cree_le TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_trace_livreur_ts ON trace_livreurs(livreur_id, ts);
+CREATE TABLE IF NOT EXISTS mouvements_stock (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, partenaire_id INTEGER NOT NULL, article_id INTEGER NOT NULL,
+  article_nom TEXT DEFAULT '', sens TEXT NOT NULL CHECK(sens IN ('entree','sortie')), motif TEXT NOT NULL,
+  quantite REAL NOT NULL CHECK(quantite > 0), prix_unitaire REAL DEFAULT 0, note TEXT DEFAULT '',
+  facture_id INTEGER DEFAULT 0, livraison_id INTEGER DEFAULT 0, cree_le TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_mvt_stock_part ON mouvements_stock(partenaire_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_mvt_stock_livraison ON mouvements_stock(livraison_id);
+CREATE TABLE IF NOT EXISTS factures_partenaire (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, partenaire_id INTEGER NOT NULL, numero TEXT NOT NULL,
+  origine TEXT NOT NULL DEFAULT 'comptoir', livraison_id INTEGER DEFAULT 0, client_nom TEXT DEFAULT '',
+  client_tel TEXT DEFAULT '', sous_total REAL DEFAULT 0, remise REAL DEFAULT 0, total REAL DEFAULT 0,
+  moyen TEXT DEFAULT '', statut TEXT DEFAULT 'payée', note TEXT DEFAULT '', cree_le TEXT NOT NULL,
+  UNIQUE(partenaire_id, numero));
+CREATE INDEX IF NOT EXISTS idx_factures_part ON factures_partenaire(partenaire_id, id DESC);
+CREATE TABLE IF NOT EXISTS lignes_facture_partenaire (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, facture_id INTEGER NOT NULL, article_id INTEGER DEFAULT 0,
+  nom TEXT NOT NULL, prix REAL DEFAULT 0, quantite REAL DEFAULT 1);
+CREATE INDEX IF NOT EXISTS idx_lignes_facture ON lignes_facture_partenaire(facture_id);
+CREATE TABLE IF NOT EXISTS caisse_partenaire (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, partenaire_id INTEGER NOT NULL,
+  sens TEXT NOT NULL CHECK(sens IN ('entree','sortie')), categorie TEXT NOT NULL, montant REAL NOT NULL CHECK(montant > 0),
+  moyen TEXT NOT NULL, facture_id INTEGER DEFAULT 0, note TEXT DEFAULT '', date_operation TEXT NOT NULL, cree_le TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_caisse_part_date ON caisse_partenaire(partenaire_id, date_operation);
+"""
+
+
+def migrer_v15(con):
+    con.executescript(EXTRA_V15)
+    cols_p = {r[1] for r in con.execute("PRAGMA table_info(partenaires)")}
+    if "logo" not in cols_p:
+        con.execute("ALTER TABLE partenaires ADD COLUMN logo TEXT DEFAULT ''")
+    cols_a = {r[1] for r in con.execute("PRAGMA table_info(articles)")}
+    for col, typ in (("stock", "REAL DEFAULT 0"), ("suivi_stock", "INTEGER DEFAULT 0"),
+                     ("seuil_alerte", "REAL DEFAULT 0"), ("prix_achat", "REAL DEFAULT 0")):
+        if col not in cols_a:
+            con.execute(f"ALTER TABLE articles ADD COLUMN {col} {typ}")
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_facture_livraison ON factures_partenaire(livraison_id) WHERE livraison_id>0")
+
+
+_init_db_v14 = init_db
+
+
+def init_db():
+    _init_db_v14()
+    with db() as con:
+        migrer_v15(con)
+
+
+def qte_txt(v):
+    v = float(v or 0)
+    return ("%g" % round(v, 3)).replace(".", ",")
+
+
+app.jinja_env.filters["qte"] = qte_txt
+MOYENS_BOUTIQUE = ["Espèces", "Orange Money", "Moov Money", "Carte bancaire", "Autre"]
+ETATS_DIFFICILES = ("annulé", "injoignable", "reporté")
+
+
+def _jour_valide(texte):
+    try:
+        return datetime.strptime(texte or "", "%Y-%m-%d").date()
+    except ValueError:
+        return date.today()
+
+
+# ---------- 1. livraisons du jour (page d'ouverture) ----------
+LEAFLET = """<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>"""
+
+CARTE_CSS = """<style>
+.live-wrap{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:14px}
+.carte-live{height:430px;border-radius:14px;border:1px solid var(--bord);overflow:hidden;background:var(--soft);z-index:0}
+.carte-live.grande{height:calc(100vh - 210px);min-height:420px}
+.lv-panel{display:flex;flex-direction:column;gap:8px;max-height:430px;overflow-y:auto}
+.lv-item{border:1px solid var(--bord);border-radius:12px;padding:10px 12px;cursor:pointer;background:var(--card)}
+.lv-item:hover{border-color:var(--vert2)}.lv-item b{display:block}.lv-item small{color:var(--mut);display:block}
+.pt{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:#9aa8a0}
+.pt.direct{background:#13a355;box-shadow:0 0 0 3px rgba(19,163,85,.25)}.pt.recent{background:#f0a500}.pt.ancien{background:#9aa8a0}
+.mk{display:inline-flex;align-items:center;gap:5px;background:#fff;color:#0f1b14;border:2px solid #13a355;border-radius:999px;padding:3px 9px 3px 5px;font:700 12px system-ui;box-shadow:0 4px 12px rgba(0,0,0,.25);white-space:nowrap;transform:translate(-50%,-50%)}
+.mk.recent{border-color:#f0a500}.mk.ancien{border-color:#9aa8a0;opacity:.75}
+.mk-dest{font-size:18px;transform:translate(-50%,-100%)}
+.live-etat{font-size:.8rem;color:var(--mut)}.nouv{display:none;margin:0 0 12px;padding:10px 14px;border-radius:12px;background:rgba(240,165,0,.14);border:1px solid rgba(240,165,0,.5);font-weight:650}
+.jr-kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:16px}
+.jr-kpis a{text-decoration:none;color:inherit}.jr-kpis .stat.on{outline:2px solid var(--vert2)}
+.jr-chips{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}.jr-chips a{padding:6px 12px;border-radius:999px;border:1px solid var(--bord);text-decoration:none;font-size:.84rem;font-weight:650;color:var(--txt);background:var(--card)}
+.jr-chips a.on{background:var(--vert);border-color:var(--vert);color:#fff}
+@media(max-width:1100px){.jr-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:900px){.live-wrap{grid-template-columns:1fr}.lv-panel{max-height:none}.carte-live{height:340px}.jr-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style>"""
+
+CARTE_HTML = """<div class="live-wrap"><div id="carte" class="carte-live {{ 'grande' if grande }}"></div>
+<div><div class="live-etat" id="liveEtat">Chargement des positions…</div><div class="lv-panel" id="lvPanel"></div></div></div>
+<script>
+(function(){
+const API = {{ url_for('api_carte')|tojson }}, JOUR_N = {{ (jour_n or 0)|tojson }}, TEMPS_REEL = {{ temps_reel|tojson }};
+const zone = document.getElementById('carte'), panel = document.getElementById('lvPanel'), etat = document.getElementById('liveEtat');
+function esc(t){return String(t == null ? '' : t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function depuis(s){if(s < 60) return 'il y a ' + Math.max(1, Math.round(s)) + ' s'; if(s < 3600) return 'il y a ' + Math.round(s/60) + ' min'; return 'il y a ' + Math.round(s/3600) + ' h';}
+if(!window.L){zone.innerHTML = '<p class="vide">Carte indisponible : le PC doit être connecté à Internet pour charger le fond de carte.</p>';}
+const carte = window.L ? L.map(zone).setView([12.3714, -1.5197], 12) : null;
+if(carte){L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '&copy; OpenStreetMap'}).addTo(carte);}
+const marqueurs = {}, traces = {}, couche = carte ? L.layerGroup().addTo(carte) : null; let cadre = false;
+function majPanel(d){
+  let h = '';
+  d.livreurs.forEach(lv => {
+    const info = lv.lat == null ? 'Position non partagée' : (lv.etat === 'direct' ? 'En direct · ' : 'Dernière position ') + depuis(lv.age_s);
+    const course = lv.courses.length ? lv.courses.map(c => esc(c.numero) + ' (' + esc(c.etat) + ')').join(', ') : 'Aucune course en cours';
+    h += '<div class="lv-item" data-id="' + lv.id + '"><b><span class="pt ' + esc(lv.etat) + '"></span>' + esc(lv.nom) + '</b><small>' + info + '</small><small>' + course + '</small>' + (lv.tel ? '<small><a href="tel:' + esc(lv.tel) + '">📞 ' + esc(lv.tel) + '</a></small>' : '') + '</div>';
+  });
+  panel.innerHTML = h || '<p class="mut">Aucun livreur actif.</p>';
+  panel.querySelectorAll('.lv-item').forEach(el => el.addEventListener('click', () => {
+    const m = marqueurs[el.dataset.id]; if(m && carte){carte.setView(m.getLatLng(), 16); m.openPopup();}
+  }));
+}
+function majCarte(d){
+  if(!carte) return;
+  const vus = {}, points = [];
+  d.livreurs.forEach(lv => {
+    if(lv.lat == null) return;
+    vus[lv.id] = 1; const pos = [lv.lat, lv.lon]; points.push(pos);
+    const html = '<div class="mk ' + esc(lv.etat) + '">🏍️ ' + esc(lv.nom) + '</div>';
+    const icone = L.divIcon({className: '', html: html, iconSize: null});
+    const popup = '<b>' + esc(lv.nom) + '</b><br>' + depuis(lv.age_s) + (lv.vitesse ? ' · ' + Math.round(lv.vitesse * 3.6) + ' km/h' : '') + '<br>' + (lv.courses.map(c => esc(c.numero) + ' → ' + esc(c.dest)).join('<br>') || 'Aucune course');
+    if(marqueurs[lv.id]){marqueurs[lv.id].setLatLng(pos).setIcon(icone).setPopupContent(popup);}
+    else{marqueurs[lv.id] = L.marker(pos, {icon: icone}).bindPopup(popup).addTo(carte);}
+    if(lv.trace && lv.trace.length > 1){
+      if(traces[lv.id]) traces[lv.id].setLatLngs(lv.trace);
+      else traces[lv.id] = L.polyline(lv.trace, {color: '#13a355', weight: 3, opacity: .55}).addTo(carte);
+    }
+  });
+  Object.keys(marqueurs).forEach(id => { if(!vus[id]){carte.removeLayer(marqueurs[id]); delete marqueurs[id]; if(traces[id]){carte.removeLayer(traces[id]); delete traces[id];}} });
+  couche.clearLayers();
+  d.destinations.forEach(x => { points.push([x.lat, x.lon]);
+    L.marker([x.lat, x.lon], {icon: L.divIcon({className: '', html: '<div class="mk-dest">📍</div>', iconSize: null})})
+     .bindPopup('<b>' + esc(x.numero) + '</b> · ' + esc(x.statut) + '<br>' + esc(x.adresse) + (x.livreur ? '<br>🏍️ ' + esc(x.livreur) : '')).addTo(couche); });
+  if(!cadre && points.length){carte.fitBounds(points, {padding: [40, 40], maxZoom: 15}); cadre = true;}
+}
+async function maj(){
+  try{
+    const r = await fetch(API, {credentials: 'same-origin', cache: 'no-store'});
+    if(!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    majPanel(d); majCarte(d);
+    const actifs = d.livreurs.filter(l => l.etat === 'direct').length;
+    etat.textContent = actifs + ' livreur' + (actifs > 1 ? 's' : '') + ' en direct · mise à jour ' + d.heure;
+    const n = document.getElementById('nouv');
+    if(TEMPS_REEL && n && d.jour_n > JOUR_N){n.style.display = 'block'; n.querySelector('b').textContent = d.jour_n - JOUR_N;}
+  }catch(e){etat.textContent = '⚠️ Connexion perdue, nouvel essai dans 10 s…';}
+}
+maj(); setInterval(maj, 10000);
+})();
+</script>"""
+
+PAGE_JOUR = BASE.replace("{% block corps %}{% endblock %}", LEAFLET + CARTE_CSS + """
+<header class="entete"><div><h1>☀️ Livraisons {{ 'du jour' if est_aujourdhui else 'du ' ~ jour_affiche }}</h1>
+<p>{{ jour_affiche }} · toutes les commandes et courses créées ou traitées ce jour-là. Les boutons Collecté / Livré / Payé enregistrent l'heure tout seuls.</p></div>
+<div class="actions"><a class="btn" href="{{ url_for('nouvelle') }}">＋ Nouvelle livraison</a>
+<form method="get" style="display:flex;gap:6px;align-items:center"><input type="date" name="jour" value="{{ jour }}" onchange="this.form.submit()" style="width:auto"></form>
+{% if not est_aujourdhui %}<a class="btn sec" href="{{ url_for('accueil') }}">Aujourd'hui</a>{% endif %}
+<a class="btn sec" href="{{ url_for('tableau_complet') }}">📊 Tableau de bord complet</a></div></header>
+<div class="nouv" id="nouv">🔔 <b>0</b> nouvelle(s) livraison(s) depuis l'ouverture de la page. <a href="">Actualiser</a></div>
+<div class="jr-kpis">
+<a href="{{ url_for('accueil', jour=jour) }}"><div class="stat {{ 'on' if vue == 'tout' }}"><b>{{ k.total }}</b><span>commandes du jour</span></div></a>
+<a href="{{ url_for('accueil', jour=jour, vue='attente') }}"><div class="stat ambre {{ 'on' if vue == 'attente' }}"><b>{{ k.attente }}</b><span>⏳ à récupérer</span></div></a>
+<a href="{{ url_for('accueil', jour=jour, vue='route') }}"><div class="stat ambre {{ 'on' if vue == 'route' }}"><b>{{ k.route }}</b><span>🏍️ en route</span></div></a>
+<a href="{{ url_for('accueil', jour=jour, vue='livre') }}"><div class="stat {{ 'on' if vue == 'livre' }}"><b>{{ k.livre }}</b><span>✅ livrées</span></div></a>
+<a href="{{ url_for('accueil', jour=jour, vue='impaye') }}"><div class="stat rouge {{ 'on' if vue == 'impaye' }}"><b>{{ k.a_encaisser|fcfa }} F</b><span>💰 à encaisser</span></div></a>
+<a href="{{ url_for('accueil', jour=jour, vue='probleme') }}"><div class="stat rouge {{ 'on' if vue == 'probleme' }}"><b>{{ k.probleme }}</b><span>⚠️ problèmes</span></div></a>
+</div>
+<section class="card"><h2>🗺️ Livreurs en direct <a class="btn sec" style="float:right;padding:5px 12px;font-size:.8rem" href="{{ url_for('carte_direct') }}">Plein écran</a></h2>
+""" + CARTE_HTML + """
+<p class="mut" style="margin:10px 0 0">Chaque livreur active « Partager ma position » dans son espace livreur (téléphone, adresse https). 🟢 en direct · 🟠 il y a plus de 2 min · ⚪ position ancienne. 📍 = adresses de livraison déjà repérées.</p></section>
+<section class="card"><h2>📦 {{ lignes|length }} livraison{{ 's' if lignes|length > 1 }} · {{ k.revenu|fcfa }} F de courses · {{ k.encaisse|fcfa }} F encaissés</h2>
+<nav class="jr-chips">{% for code, lib in vues %}<a class="{{ 'on' if vue == code }}" href="{{ url_for('accueil', jour=jour, vue=code) }}">{{ lib }}</a>{% endfor %}</nav>
+{% if lignes %}""" + LIGNES + """{% else %}<p class="vide">Aucune livraison {{ 'pour ce filtre' if vue != 'tout' else 'pour ce jour' }}.</p>{% endif %}</section>
+{% if retard %}<section class="card" style="border-color:rgba(240,165,0,.5)"><h2>⏰ Toujours en cours depuis les jours précédents ({{ retard|length }})</h2>""" + LIGNES.replace("lignes", "retard") + """</section>{% endif %}
+""")
+
+PAGE_CARTE = BASE.replace("{% block corps %}{% endblock %}", LEAFLET + CARTE_CSS + """
+<header class="entete"><div><h1>🗺️ Carte en direct</h1><p>Positions des livreurs mises à jour toutes les 10 secondes.</p></div>
+<div class="actions"><a class="btn sec" href="{{ url_for('accueil') }}">☀️ Livraisons du jour</a></div></header>
+<section class="card">""" + CARTE_HTML + """</section>""")
+
+VUES_JOUR = [("tout", "Toutes"), ("attente", "⏳ À récupérer"), ("route", "🏍️ En route"), ("livre", "✅ Livrées"),
+             ("impaye", "💰 À encaisser"), ("probleme", "⚠️ Problèmes")]
+
+
+def _filtre_vue(l, vue):
+    if vue == "attente":
+        return l["statut"] == "en attente"
+    if vue == "route":
+        return l["statut"] == "collecté"
+    if vue == "livre":
+        return l["statut"] == "livré"
+    if vue == "impaye":
+        return l["statut"] == "livré" and l["statut_paiement"] != "payé"
+    if vue == "probleme":
+        return l["statut"] in ETATS_DIFFICILES or (l["auto_etat"] or "") in ("a_verifier", "erreur_envoi", "a_completer")
+    return True
+
+
+accueil_tableau_complet = app.view_functions["accueil"]
+app.add_url_rule("/tableau-de-bord", "tableau_complet", accueil_tableau_complet)
+
+
+def accueil_du_jour():
+    j = _jour_valide(request.args.get("jour", ""))
+    jour = j.isoformat()
+    vue = request.args.get("vue", "tout")
+    if vue not in dict(VUES_JOUR):
+        vue = "tout"
+    with db() as con:
+        toutes_lignes = con.execute(
+            "SELECT * FROM livraisons WHERE date(cree_le)=? OR date(NULLIF(heure_collecte,''))=? "
+            "OR date(NULLIF(heure_livraison,''))=? OR date(NULLIF(heure_paiement,''))=? ORDER BY id DESC",
+            (jour, jour, jour, jour)).fetchall()
+        retard = []
+        if j == date.today():
+            retard = con.execute("SELECT * FROM livraisons WHERE statut IN ('en attente','collecté') AND date(cree_le)<? "
+                                 "ORDER BY id LIMIT 50", (jour,)).fetchall()
+            ids = {l["id"] for l in toutes_lignes}
+            retard = [l for l in retard if l["id"] not in ids]
+    valides = [l for l in toutes_lignes if l["statut"] != "annulé"]
+    k = {"total": len(valides),
+         "attente": sum(1 for l in valides if l["statut"] == "en attente"),
+         "route": sum(1 for l in valides if l["statut"] == "collecté"),
+         "livre": sum(1 for l in valides if l["statut"] == "livré"),
+         "probleme": sum(1 for l in toutes_lignes if _filtre_vue(l, "probleme")),
+         "revenu": sum(l["prix_course"] or 0 for l in valides),
+         "encaisse": sum(l["prix_course"] or 0 for l in valides if l["statut_paiement"] == "payé"),
+         "a_encaisser": sum(l["prix_course"] or 0 for l in valides if l["statut"] == "livré" and l["statut_paiement"] != "payé")}
+    lignes = [l for l in toutes_lignes if _filtre_vue(l, vue)]
+    jours_fr = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+    return render_template_string(PAGE_JOUR, lignes=lignes, retard=retard, k=k, vue=vue, vues=VUES_JOUR, jour=jour,
+                                  jour_affiche=f"{jours_fr[j.weekday()]} {j.strftime('%d/%m/%Y')}",
+                                  est_aujourdhui=(j == date.today()), jour_n=len(toutes_lignes),
+                                  temps_reel=(j == date.today()), grande=False)
+
+
+app.view_functions["accueil"] = accueil_du_jour
+
+
+@app.route("/carte")
+def carte_direct():
+    return render_template_string(PAGE_CARTE, jour_n=0, temps_reel=False, grande=True)
+
+
+def _position_connue(con, *textes):
+    for t in textes:
+        t = " ".join((t or "").split()).lower()
+        if t:
+            r = con.execute("SELECT lat, lon FROM geocache WHERE cle=? AND lat IS NOT NULL", (t,)).fetchone()
+            if r:
+                return r["lat"], r["lon"]
+    return None
+
+
+@app.route("/api/carte")
+def api_carte():
+    """Positions des livreurs + destinations du jour déjà géocodées (aucun appel Internet ici)."""
+    maintenant_ts = time.time()
+    aujourdhui = date.today().isoformat()
+    etats = {"en attente": "à récupérer", "collecté": "en route"}
+    with db() as con:
+        livreurs_actifs = con.execute("SELECT id, nom, tel FROM livreurs WHERE actif=1 ORDER BY nom").fetchall()
+        positions = {r["livreur_id"]: r for r in con.execute("SELECT * FROM positions_livreurs")}
+        en_cours = con.execute("SELECT id, numero, statut, livreur, livraison_adresse, livraison_quartier FROM livraisons "
+                               "WHERE statut IN ('en attente','collecté') ORDER BY id").fetchall()
+        jour_n = con.execute("SELECT COUNT(*) FROM livraisons WHERE date(cree_le)=? OR date(NULLIF(heure_collecte,''))=? "
+                             "OR date(NULLIF(heure_livraison,''))=? OR date(NULLIF(heure_paiement,''))=?",
+                             (aujourdhui,) * 4).fetchone()[0]
+        sortie = []
+        for lv in livreurs_actifs:
+            p = positions.get(lv["id"])
+            courses = [{"numero": c["numero"], "etat": etats.get(c["statut"], c["statut"]),
+                        "dest": " · ".join(x for x in (c["livraison_adresse"], c["livraison_quartier"]) if x)}
+                       for c in en_cours if c["livreur"] == lv["nom"]]
+            item = {"id": lv["id"], "nom": lv["nom"], "tel": lv["tel"] or "", "courses": courses,
+                    "lat": None, "lon": None, "age_s": None, "etat": "aucune", "vitesse": 0, "trace": []}
+            if p and maintenant_ts - p["maj_ts"] < 12 * 3600:
+                age = max(0, maintenant_ts - p["maj_ts"])
+                item.update(lat=p["lat"], lon=p["lon"], age_s=round(age), vitesse=p["vitesse"] or 0,
+                            etat="direct" if age <= 120 else ("recent" if age <= 900 else "ancien"))
+                trace = con.execute("SELECT lat, lon FROM trace_livreurs WHERE livreur_id=? AND ts>=? ORDER BY ts DESC LIMIT 400",
+                                    (lv["id"], maintenant_ts - 4 * 3600)).fetchall()
+                item["trace"] = [[t["lat"], t["lon"]] for t in reversed(trace)]
+            sortie.append(item)
+        sortie.sort(key=lambda x: ({"direct": 0, "recent": 1, "ancien": 2}.get(x["etat"], 3), x["nom"].lower()))
+        destinations = []
+        for c in en_cours[:60]:
+            pos = _position_connue(con, f"{c['livraison_adresse'] or ''} {c['livraison_quartier'] or ''}",
+                                   c["livraison_adresse"], c["livraison_quartier"])
+            if pos:
+                destinations.append({"numero": c["numero"], "statut": etats.get(c["statut"], c["statut"]),
+                                     "livreur": c["livreur"] or "", "lat": pos[0], "lon": pos[1],
+                                     "adresse": " · ".join(x for x in (c["livraison_adresse"], c["livraison_quartier"]) if x)})
+    reponse = jsonify({"livreurs": sortie, "destinations": destinations, "jour_n": jour_n,
+                       "heure": datetime.now().strftime("%H:%M:%S")})
+    reponse.headers["Cache-Control"] = "no-store"
+    return reponse
+
+
+@app.route("/portail-livreur/position", methods=["POST"])
+def portail_livreur_position():
+    identite, reponse = _auth_portail("livreur")
+    if reponse:
+        return jsonify({"ok": False, "erreur": "connexion"}), 401
+    livreur_id = identite["profil"]["id"]
+    if request.form.get("arret") == "1":
+        with db() as con:
+            con.execute("DELETE FROM positions_livreurs WHERE livreur_id=?", (livreur_id,))
+        return jsonify({"ok": True, "arret": True})
+    try:
+        lat, lon = float(request.form.get("lat", "")), float(request.form.get("lon", ""))
+    except ValueError:
+        return jsonify({"ok": False, "erreur": "position invalide"}), 400
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify({"ok": False, "erreur": "position invalide"}), 400
+
+    def nb(cle):
+        try:
+            v = float(request.form.get(cle, "") or 0)
+            return v if v == v and abs(v) < 1e6 else 0
+        except ValueError:
+            return 0
+    ts = time.time()
+    with db() as con:
+        precedent = con.execute("SELECT lat, lon, ts FROM trace_livreurs WHERE livreur_id=? ORDER BY ts DESC LIMIT 1",
+                                (livreur_id,)).fetchone()
+        con.execute("INSERT OR REPLACE INTO positions_livreurs(livreur_id, lat, lon, precision_m, vitesse, cap, maj_ts, maj_le) "
+                    "VALUES (?,?,?,?,?,?,?,?)", (livreur_id, lat, lon, nb("precision"), nb("vitesse"), nb("cap"), ts, maintenant()))
+        if (not precedent or ts - precedent["ts"] >= 60
+                or vol_oiseau_km((precedent["lat"], precedent["lon"]), (lat, lon)) >= 0.02):
+            con.execute("INSERT INTO trace_livreurs(livreur_id, lat, lon, ts, cree_le) VALUES (?,?,?,?,?)",
+                        (livreur_id, lat, lon, ts, maintenant()))
+        if secrets.randbelow(200) == 0:
+            con.execute("DELETE FROM trace_livreurs WHERE ts<?", (ts - 3 * 86400,))
+    return jsonify({"ok": True, "heure": datetime.now().strftime("%H:%M:%S")})
+
+
+_portail_livreur_base = app.view_functions["portail_livreur"]
+
+
+def portail_livreur_avec_gps():
+    reponse = app.make_response(_portail_livreur_base())
+    # le navigateur n'autorise le GPS que si cette page le permet explicitement
+    reponse.headers["Permissions-Policy"] = "camera=(), geolocation=(self), microphone=()"
+    return reponse
+
+
+app.view_functions["portail_livreur"] = portail_livreur_avec_gps
+
+GPS_LIVREUR = """
+<section class="dl-gps" id="gpsBloc"><div><b>📡 Suivi en direct</b><div class="mut" id="gpsEtat">Ta position n'est pas partagée.</div></div>
+<button type="button" class="btn" id="gpsBtn">Partager ma position</button></section>
+<style>.dl-gps{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;background:var(--card);border:1px solid var(--bord);border-radius:16px;padding:13px 15px;margin:0 0 16px;box-shadow:var(--ombre)}.dl-gps.on{border-color:var(--vert2);background:var(--soft)}</style>
+<script>
+(function(){
+const URL_POS = {{ url_for('portail_livreur_position')|tojson }}, CSRF = {{ csrf_portail()|tojson }};
+const btn = document.getElementById('gpsBtn'), etat = document.getElementById('gpsEtat'), bloc = document.getElementById('gpsBloc');
+let suivi = null, minuteur = null, verrou = null, dernier = 0, derniere = null;
+function dire(t){etat.textContent = t;}
+function envoyer(pos, force){
+  derniere = pos; const now = Date.now();
+  if(!force && now - dernier < 8000) return;
+  dernier = now;
+  const fd = new FormData(); fd.append('_csrf', CSRF);
+  fd.append('lat', pos.coords.latitude); fd.append('lon', pos.coords.longitude);
+  fd.append('precision', pos.coords.accuracy || 0); fd.append('vitesse', pos.coords.speed || 0); fd.append('cap', pos.coords.heading || 0);
+  fetch(URL_POS, {method: 'POST', body: fd, credentials: 'same-origin'}).then(r => r.json()).then(d => {
+    dire(d.ok ? '🟢 Position partagée · envoyée à ' + d.heure + ' (précision ' + Math.round(pos.coords.accuracy || 0) + ' m)' : '⚠️ Envoi refusé : reconnecte-toi.');
+  }).catch(() => dire('⚠️ Pas de réseau, nouvel essai automatique…'));
+}
+async function garderEcran(){try{if('wakeLock' in navigator){verrou = await navigator.wakeLock.request('screen');}}catch(e){}}
+function erreur(e){
+  if(e.code === 1){dire('⛔ Autorise la localisation pour ce site dans ton navigateur, puis réessaie.'); arreter(true);}
+  else dire('⚠️ GPS indisponible pour le moment (' + e.message + '), nouvel essai…');
+}
+function demarrer(){
+  if(!('geolocation' in navigator)){dire('Ce téléphone ne permet pas la localisation.'); return;}
+  if(!window.isSecureContext){dire('⚠️ Le GPS ne marche que sur une adresse https (lien ngrok ou hébergement). Demande le bon lien au responsable.'); return;}
+  suivi = navigator.geolocation.watchPosition(p => envoyer(p, false), erreur, {enableHighAccuracy: true, maximumAge: 5000, timeout: 30000});
+  minuteur = setInterval(() => navigator.geolocation.getCurrentPosition(p => envoyer(p, true), () => {}, {enableHighAccuracy: true, maximumAge: 15000, timeout: 20000}), 30000);
+  localStorage.setItem('gps_livreur', '1'); garderEcran();
+  bloc.classList.add('on'); btn.textContent = 'Arrêter le partage'; btn.classList.add('sec'); dire('Recherche du GPS…');
+}
+function arreter(silencieux){
+  if(suivi !== null) navigator.geolocation.clearWatch(suivi); if(minuteur) clearInterval(minuteur); suivi = null; minuteur = null;
+  localStorage.removeItem('gps_livreur'); if(verrou){verrou.release().catch(() => {}); verrou = null;}
+  bloc.classList.remove('on'); btn.textContent = 'Partager ma position'; btn.classList.remove('sec');
+  if(!silencieux){const fd = new FormData(); fd.append('_csrf', CSRF); fd.append('arret', '1'); fetch(URL_POS, {method: 'POST', body: fd, credentials: 'same-origin'}); dire('Partage arrêté.');}
+}
+btn.addEventListener('click', () => suivi === null ? demarrer() : arreter(false));
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible' && suivi !== null){garderEcran(); if(derniere) envoyer(derniere, true);} });
+if(localStorage.getItem('gps_livreur') === '1') demarrer();
+})();
+</script>
+<p class="mut" style="margin:-8px 0 16px">Garde cette page ouverte pendant tes courses : l'écran reste allumé et ta position est envoyée au responsable toutes les 10 à 30 secondes.</p>
+"""
+
+
+# ---------- 2. logo et photo de profil du partenaire ----------
+@app.route("/espace/images", methods=["POST"])
+def espace_images():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    quoi = request.form.get("quoi", "")
+    if quoi not in ("logo", "photo"):
+        abort(400)
+    libelle = "Logo" if quoi == "logo" else "Photo de profil"
+    ancien = p.get(quoi) or ""
+    if request.form.get("supprimer") == "1":
+        with db() as con:
+            con.execute(f"UPDATE partenaires SET {quoi}='' WHERE id=?", (p["id"],))
+        supprimer_photo(ancien)
+        return redirect(url_for("espace_compte", msg=f"{libelle} retiré(e)."))
+    try:
+        nom = enregistrer_photo(request.files.get("image"))
+    except ValueError as e:
+        return redirect(url_for("espace_compte", msg=str(e)))
+    if not nom:
+        return redirect(url_for("espace_compte", msg="Choisis d'abord une image."))
+    with db() as con:
+        con.execute(f"UPDATE partenaires SET {quoi}=? WHERE id=?", (nom, p["id"]))
+    supprimer_photo(ancien)
+    return redirect(url_for("espace_compte", msg=f"{libelle} mis(e) à jour. Il est visible dans la boutique."))
+
+
+BLOC_IMAGES_PARTENAIRE = """<section class="acct-card"><h2>🖼️ Logo et photo de profil</h2>
+<p class="mut">Le logo apparaît sur votre carte dans la boutique et en haut de votre page. La photo de profil sert de grande image de couverture (devanture, plat phare, équipe…). JPG, PNG ou WEBP, 1,5 Mo maximum.</p>
+<style>.img-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.apercu{height:130px;border-radius:16px;border:1px dashed var(--bord);display:grid;place-items:center;overflow:hidden;background:var(--soft);font-size:2.4rem;font-weight:800;color:var(--vert)}.apercu img{width:100%;height:100%;object-fit:cover}.apercu.rond{width:130px;border-radius:24px;margin:0 auto}.img-grid form.sup button{background:transparent;color:#d64545;border:1px solid #d64545;margin-top:8px}@media(max-width:560px){.img-grid{grid-template-columns:1fr}}</style>
+<div class="img-grid">
+<div><form method="post" action="{{ url_for('espace_images') }}" enctype="multipart/form-data" data-redim="1"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><input type="hidden" name="quoi" value="logo">
+<div class="apercu rond">{% if p.logo %}<img src="{{ url_for('photo', nom=p.logo) }}" alt="Logo">{% else %}{{ initiale(p.nom) }}{% endif %}</div>
+<label>Logo (carré conseillé)<input type="file" name="image" accept="image/jpeg,image/png,image/webp" required></label><button>Enregistrer le logo</button></form>
+{% if p.logo %}<form class="sup" method="post" action="{{ url_for('espace_images') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><input type="hidden" name="quoi" value="logo"><input type="hidden" name="supprimer" value="1"><button>Retirer le logo</button></form>{% endif %}</div>
+<div><form method="post" action="{{ url_for('espace_images') }}" enctype="multipart/form-data"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><input type="hidden" name="quoi" value="photo">
+<div class="apercu">{% if p.photo %}<img src="{{ url_for('photo', nom=p.photo) }}" alt="Photo de profil">{% else %}📷{% endif %}</div>
+<label>Photo de profil / couverture<input type="file" name="image" accept="image/*" required></label><button>Enregistrer la photo</button></form>
+{% if p.photo %}<form class="sup" method="post" action="{{ url_for('espace_images') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><input type="hidden" name="quoi" value="photo"><input type="hidden" name="supprimer" value="1"><button>Retirer la photo</button></form>{% endif %}</div>
+</div></section>"""
+
+
+# ---------- 3. magasin (stock), caisse et factures du partenaire ----------
+class StockInsuffisant(ValueError):
+    pass
+
+
+def mouvement_stock(con, pid, article_id, sens, quantite, motif, note="", prix=0, facture_id=0, livraison_id=0, controle=True, auto=False):
+    a = con.execute("SELECT * FROM articles WHERE id=? AND partenaire_id=?", (article_id, pid)).fetchone()
+    if not a:
+        if auto:
+            return
+        raise ValueError("Article introuvable.")
+    if auto and not a["suivi_stock"]:
+        return  # ventes automatiques : seuls les articles dont le stock est suivi bougent
+    q = float(quantite or 0)
+    if q <= 0:
+        raise ValueError("La quantité doit être supérieure à 0.")
+    if sens == "sortie" and controle and a["suivi_stock"] and q > (a["stock"] or 0) + 1e-9:
+        raise StockInsuffisant(f"Stock insuffisant pour « {a['nom']} » : il en reste {qte_txt(a['stock'])}.")
+    con.execute("INSERT INTO mouvements_stock(partenaire_id, article_id, article_nom, sens, motif, quantite, prix_unitaire, note, "
+                "facture_id, livraison_id, cree_le) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (pid, article_id, a["nom"], sens, motif, q, prix or 0, (note or "")[:200], facture_id, livraison_id, maintenant()))
+    con.execute("UPDATE articles SET stock=COALESCE(stock,0)" + ("+" if sens == "entree" else "-") + "? WHERE id=?", (q, article_id))
+
+
+def _numero_facture(con, pid):
+    n = con.execute("SELECT COUNT(*) FROM factures_partenaire WHERE partenaire_id=?", (pid,)).fetchone()[0] + 1
+    while con.execute("SELECT 1 FROM factures_partenaire WHERE partenaire_id=? AND numero=?", (pid, f"F{pid:03d}-{n:05d}")).fetchone():
+        n += 1
+    return f"F{pid:03d}-{n:05d}"
+
+
+def synchroniser_ventes_en_ligne(pid):
+    """Commandes de la boutique en ligne : sortie de stock à la collecte, retour si annulée, facture une fois livrée."""
+    with db() as con:
+        cmds = con.execute("SELECT * FROM livraisons l WHERE partenaire_id=? AND statut IN ('collecté','livré','annulé') "
+                           "AND EXISTS(SELECT 1 FROM lignes_commande c WHERE c.livraison_id=l.id) ORDER BY id DESC LIMIT 300",
+                           (pid,)).fetchall()
+        for l in cmds:
+            mvts = con.execute("SELECT sens, COUNT(*) n FROM mouvements_stock WHERE livraison_id=? AND partenaire_id=? GROUP BY sens",
+                               (l["id"], pid)).fetchall()
+            deja = {m["sens"]: m["n"] for m in mvts}
+            lignes = con.execute("SELECT c.* FROM lignes_commande c JOIN articles a ON a.id=c.article_id AND a.partenaire_id=? "
+                                 "WHERE c.livraison_id=?", (pid, l["id"])).fetchall()
+            if l["statut"] in ("collecté", "livré") and not deja.get("sortie"):
+                for c in lignes:
+                    if (c["quantite"] or 0) > 0:
+                        mouvement_stock(con, pid, c["article_id"], "sortie", c["quantite"], "vente en ligne",
+                                        note=l["numero"] or "", prix=c["prix"] or 0, livraison_id=l["id"], controle=False, auto=True)
+            if l["statut"] == "annulé" and deja.get("sortie") and not deja.get("entree"):
+                sortis = {r[0] for r in con.execute("SELECT article_id FROM mouvements_stock WHERE livraison_id=? AND sens='sortie'", (l["id"],))}
+                for c in [c for c in lignes if c["article_id"] in sortis]:
+                    if (c["quantite"] or 0) > 0:
+                        mouvement_stock(con, pid, c["article_id"], "entree", c["quantite"], "retour commande annulée",
+                                        note=l["numero"] or "", livraison_id=l["id"])
+            if l["statut"] == "livré" and lignes and not con.execute(
+                    "SELECT 1 FROM factures_partenaire WHERE livraison_id=?", (l["id"],)).fetchone():
+                total = sum((c["prix"] or 0) * (c["quantite"] or 0) for c in lignes)
+                con.execute("INSERT INTO factures_partenaire(partenaire_id, numero, origine, livraison_id, client_nom, client_tel, "
+                            "sous_total, remise, total, moyen, statut, note, cree_le) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (pid, _numero_facture(con, pid), "en ligne", l["id"], l["client_nom"] or "", l["client_tel"] or "",
+                             total, 0, total, l["mode_paiement"] or "", "payée", f"Commande {l['numero'] or ''}",
+                             l["heure_livraison"] or l["cree_le"] or maintenant()))
+                fid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                for c in lignes:
+                    con.execute("INSERT INTO lignes_facture_partenaire(facture_id, article_id, nom, prix, quantite) VALUES (?,?,?,?,?)",
+                                (fid, c["article_id"], c["nom"], c["prix"] or 0, c["quantite"] or 0))
+
+
+def _etat_stock(a):
+    if not a["suivi_stock"]:
+        return "non suivi"
+    if (a["stock"] or 0) <= 0:
+        return "épuisé"
+    if (a["stock"] or 0) <= (a["seuil_alerte"] or 0):
+        return "alerte"
+    return "ok"
+
+
+app.jinja_env.globals.update(etat_stock=_etat_stock)
+
+ESPACE_CSS_PLUS = """<style>
+.etat-stock{display:inline-block;padding:2px 9px;border-radius:999px;font-size:.74rem;font-weight:750;background:var(--soft);color:var(--vert)}
+.etat-stock.alerte{background:rgba(240,165,0,.16);color:#a87400}.etat-stock.épuisé{background:rgba(214,69,69,.14);color:#d64545}.etat-stock.non{color:var(--mut)}
+.duo{display:grid;grid-template-columns:1fr 1fr;gap:12px}.f textarea{width:100%;padding:10px 12px;border:1px solid var(--bord);border-radius:10px;font:inherit;background:var(--card);color:var(--txt)}
+.f button.btn{margin-top:12px}.pos-art{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--bord)}
+.pos-art:last-child{border:0}.pos-art .qte input{width:56px;text-align:center;padding:6px;border:1px solid var(--bord);border-radius:9px;font:inherit;background:var(--card);color:var(--txt)}
+.pos-total{position:sticky;bottom:72px;background:var(--card);border:2px solid var(--vert2);border-radius:16px;padding:12px 14px;margin-top:12px;box-shadow:var(--ombre)}
+.pos-total b{font-size:1.3rem}.r{text-align:right}.danger-btn{background:transparent;color:#d64545;border:1.5px solid #d64545;border-radius:999px;padding:7px 14px;font-weight:700;cursor:pointer;font-family:inherit}
+@media(max-width:620px){.duo{grid-template-columns:1fr}}
+</style>"""
+
+OPTIONS_MOYENS = """{% for m in moyens %}<option>{{ m }}</option>{% endfor %}"""
+
+PAGE_ESPACE_CAISSE = ESPACE_HAUT + ESPACE_CSS_PLUS + """
+<h2 class="s">🧾 Caisse du {{ jour_affiche }}</h2>
+<div class="kp"><div><b>{{ k.ventes|fcfa }} F</b><span>ventes au comptoir</span></div><div><b>{{ k.en_ligne|fcfa }} F</b><span>ventes en ligne livrées</span></div>
+<div><b>{{ k.sorties|fcfa }} F</b><span>dépenses / sorties</span></div><div><b>{{ (k.entrees - k.sorties)|fcfa }} F</b><span>solde de caisse du jour</span></div>
+<div><b>{{ k.alertes }}</b><span>articles en alerte stock</span></div></div>
+{% if par_moyen %}<div class="carte"><b>Par moyen de paiement</b>{% for m in par_moyen %}<div class="pos-art"><span>{{ m.moyen }}</span><span>+{{ m.entrees|fcfa }} F · −{{ m.sorties|fcfa }} F · <b>{{ (m.entrees - m.sorties)|fcfa }} F</b></span></div>{% endfor %}</div>{% endif %}
+<form class="carte f" method="post" action="{{ url_for('espace_caisse_vente') }}" id="vente"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}">
+<b>🛒 Nouvelle vente au comptoir</b><p class="mut">Choisissez les quantités : le stock est mis à jour et une facture est créée automatiquement.</p>
+<input class="filtre" placeholder="Chercher un article…" oninput="filtrerPos(this.value)" autocomplete="off">
+{% for a in articles %}<div class="pos-art" data-t="{{ a.nom|lower }}"><div><b>{{ a.nom }}</b><div class="mut">{{ prix_effectif(a)|fcfa }} F{% if a.suivi_stock %} · stock {{ a.stock|qte }}{% endif %}{% if not a.dispo %} · masqué en ligne{% endif %}</div></div>
+<div class="qte"><button type="button" onclick="pas({{ a.id }},-1)">−</button><input name="q_{{ a.id }}" id="q{{ a.id }}" value="0" inputmode="decimal" oninput="total()"><button type="button" onclick="pas({{ a.id }},1)">+</button></div></div>
+{% else %}<p class="vide">Ajoutez d'abord des articles dans l'onglet Catalogue.</p>{% endfor %}
+<div class="g"><div><label>Remise (FCFA)</label><input name="remise" value="0" inputmode="numeric" oninput="total()"></div>
+<div><label>Paiement</label><select name="moyen">""" + OPTIONS_MOYENS + """</select></div>
+<div><label>Client (facultatif)</label><input name="client_nom" maxlength="100"></div><div><label>Téléphone (facultatif)</label><input name="client_tel" inputmode="tel"></div></div>
+<div class="pos-total"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px"><div><span class="mut">Total à encaisser</span><br><b id="tot">0 F</b></div><button class="btn">Encaisser et créer la facture</button></div></div></form>
+<form class="carte f" method="post" action="{{ url_for('espace_caisse_mouvement') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}">
+<b>➕ Autre mouvement de caisse</b><div class="g"><div><label>Type</label><select name="sens"><option value="sortie">Sortie (dépense)</option><option value="entree">Entrée (apport, autre recette)</option></select></div>
+<div><label>Catégorie</label><input name="categorie" list="cats" required placeholder="ex : Achat marchandises"></div>
+<datalist id="cats"><option>Achat marchandises</option><option>Transport</option><option>Loyer</option><option>Salaire</option><option>Électricité / eau</option><option>Apport du propriétaire</option><option>Retrait du propriétaire</option><option>Autre</option></datalist>
+<div><label>Montant (FCFA)</label><input name="montant" required inputmode="numeric"></div><div><label>Moyen</label><select name="moyen">""" + OPTIONS_MOYENS + """</select></div></div>
+<label>Note</label><input name="note" maxlength="200"><button class="btn">Enregistrer</button></form>
+<h2 class="s">Opérations du jour</h2><div class="carte" style="overflow-x:auto"><table><tr><th>Heure</th><th>Opération</th><th>Moyen</th><th class="r">Montant</th></tr>
+{% for m in mouvements %}<tr><td>{{ m.cree_le[11:16] }}</td><td>{{ m.categorie }}{% if m.facture_id %} · <a href="{{ url_for('espace_facture', id=m.facture_id) }}">facture</a>{% endif %}{% if m.note %}<div class="mut">{{ m.note }}</div>{% endif %}</td><td>{{ m.moyen }}</td><td class="r"><b>{{ '+' if m.sens == 'entree' else '−' }}{{ m.montant|fcfa }} F</b></td></tr>
+{% else %}<tr><td colspan="4" class="mut">Aucune opération ce jour-là.</td></tr>{% endfor %}</table></div>
+<form method="get" class="f"><label>Voir un autre jour</label><input type="date" name="jour" value="{{ jour }}" onchange="this.form.submit()" style="max-width:220px"></form>
+<script>
+const PRIX = {{ prix|tojson }};
+function pas(id, d){const e = document.getElementById('q' + id); e.value = Math.max(0, (parseFloat(String(e.value).replace(',', '.')) || 0) + d); total();}
+function total(){let t = 0; for(const id in PRIX){const e = document.getElementById('q' + id); t += (parseFloat(String(e.value).replace(',', '.')) || 0) * PRIX[id];}
+ const r = parseFloat(document.querySelector('[name=remise]').value) || 0; document.getElementById('tot').textContent = Math.max(0, Math.round(t - r)).toLocaleString('fr-FR') + ' F';}
+function filtrerPos(v){v = v.toLowerCase().trim(); document.querySelectorAll('#vente .pos-art').forEach(e => e.style.display = (!v || e.dataset.t.includes(v)) ? '' : 'none');}
+</script>""" + ESPACE_BAS
+
+PAGE_ESPACE_STOCK = ESPACE_HAUT + ESPACE_CSS_PLUS + """
+<h2 class="s">📦 Mon magasin (stock)</h2>
+<div class="kp"><div><b>{{ k.suivis }}</b><span>articles suivis</span></div><div><b>{{ k.alertes }}</b><span>en alerte</span></div><div><b>{{ k.epuises }}</b><span>épuisés (masqués en ligne)</span></div>
+<div><b>{{ k.valeur_achat|fcfa }} F</b><span>valeur au prix d'achat</span></div><div><b>{{ k.valeur_vente|fcfa }} F</b><span>valeur au prix de vente</span></div></div>
+<div class="duo">
+<form class="carte f" method="post" action="{{ url_for('espace_stock_mouvement') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><input type="hidden" name="sens" value="entree">
+<b>⬇️ Entrée de stock</b><label>Article</label><select name="article_id" required>{% for a in articles %}<option value="{{ a.id }}">{{ a.nom }}{% if a.suivi_stock %} ({{ a.stock|qte }}){% endif %}</option>{% endfor %}</select>
+<div class="g"><div><label>Quantité</label><input name="quantite" required inputmode="decimal"></div><div><label>Prix d'achat unitaire</label><input name="prix" inputmode="numeric" placeholder="facultatif"></div></div>
+<label>Motif</label><select name="motif"><option>Achat / réapprovisionnement</option><option>Production</option><option>Retour client</option><option>Autre entrée</option></select>
+<label>Fournisseur / note</label><input name="note" maxlength="200"><label style="display:flex;gap:8px;align-items:center;color:var(--txt)"><input type="checkbox" name="payer" value="1" style="width:auto"> Enregistrer l'achat comme dépense de caisse</label>
+<button class="btn">Ajouter au stock</button></form>
+<form class="carte f" method="post" action="{{ url_for('espace_stock_mouvement') }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><input type="hidden" name="sens" value="sortie">
+<b>⬆️ Sortie de stock</b><label>Article</label><select name="article_id" required>{% for a in articles %}<option value="{{ a.id }}">{{ a.nom }}{% if a.suivi_stock %} ({{ a.stock|qte }}){% endif %}</option>{% endfor %}</select>
+<label>Quantité</label><input name="quantite" required inputmode="decimal">
+<label>Motif</label><select name="motif"><option>Perte / casse</option><option>Périmé</option><option>Usage interne</option><option>Retour fournisseur</option><option>Autre sortie</option></select>
+<label>Note</label><input name="note" maxlength="200"><p class="mut">Les ventes (comptoir et en ligne) sortent du stock toutes seules.</p><button class="btn">Retirer du stock</button></form></div>
+<h2 class="s">État du stock</h2>
+{% for a in articles %}{% set e = etat_stock(a) %}<form class="carte f" method="post" action="{{ url_for('espace_stock_article', aid=a.id) }}"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}">
+<div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>{{ a.nom }}</b><span class="etat-stock {{ 'non' if e == 'non suivi' else e }}">{% if e == 'non suivi' %}stock non suivi{% else %}{{ a.stock|qte }} en stock · {{ e }}{% endif %}</span></div>
+<div class="g"><div><label>Stock réel compté</label><input name="stock_reel" value="{{ a.stock|qte if a.suivi_stock else '' }}" inputmode="decimal" placeholder="inventaire"></div>
+<div><label>Seuil d'alerte</label><input name="seuil_alerte" value="{{ a.seuil_alerte|qte }}" inputmode="decimal"></div>
+<div><label>Prix d'achat</label><input name="prix_achat" value="{{ a.prix_achat|int }}" inputmode="numeric"></div></div>
+<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px"><label style="margin:0;display:flex;gap:8px;align-items:center;color:var(--txt)"><input type="checkbox" name="suivi_stock" value="1" style="width:auto" {{ 'checked' if a.suivi_stock }}> suivre le stock (épuisé = masqué pour les clients)</label><button class="btn" style="margin:0">Enregistrer</button></div></form>
+{% else %}<p class="vide">Aucun article. Créez-les dans l'onglet Catalogue.</p>{% endfor %}
+<h2 class="s">Historique des entrées et sorties</h2><div class="carte" style="overflow-x:auto"><table><tr><th>Date</th><th>Article</th><th>Mouvement</th><th class="r">Qté</th></tr>
+{% for m in mouvements %}<tr><td>{{ m.cree_le[:16] }}</td><td>{{ m.article_nom }}</td><td>{{ m.motif }}{% if m.note %}<div class="mut">{{ m.note }}</div>{% endif %}</td><td class="r"><b style="color:{{ '#0b7a3b' if m.sens == 'entree' else '#d64545' }}">{{ '+' if m.sens == 'entree' else '−' }}{{ m.quantite|qte }}</b></td></tr>
+{% else %}<tr><td colspan="4" class="mut">Aucun mouvement pour le moment.</td></tr>{% endfor %}</table></div>""" + ESPACE_BAS
+
+PAGE_ESPACE_FACTURES = ESPACE_HAUT + ESPACE_CSS_PLUS + """
+<h2 class="s">📄 Mes factures · {{ mois }}</h2>
+<div class="kp"><div><b>{{ k.n }}</b><span>factures</span></div><div><b>{{ k.comptoir|fcfa }} F</b><span>comptoir</span></div><div><b>{{ k.en_ligne|fcfa }} F</b><span>en ligne</span></div><div><b>{{ (k.comptoir + k.en_ligne)|fcfa }} F</b><span>chiffre d'affaires</span></div></div>
+<div class="carte" style="overflow-x:auto"><table><tr><th>N°</th><th>Date</th><th>Client</th><th>Origine</th><th class="r">Total</th></tr>
+{% for f in factures %}<tr><td><a href="{{ url_for('espace_facture', id=f.id) }}"><b>{{ f.numero }}</b></a>{% if f.statut == 'annulée' %} <span class="etat-stock épuisé">annulée</span>{% endif %}</td><td>{{ f.cree_le[:16] }}</td><td>{{ f.client_nom or '—' }}</td><td>{{ f.origine }}</td><td class="r"><b>{{ f.total|fcfa }} F</b></td></tr>
+{% else %}<tr><td colspan="5" class="mut">Aucune facture ce mois-ci.</td></tr>{% endfor %}</table></div>
+<form method="get" class="f"><label>Autre mois</label><input type="month" name="mois" value="{{ mois }}" onchange="this.form.submit()" style="max-width:220px"></form>""" + ESPACE_BAS
+
+PAGE_FACTURE_PARTENAIRE = """<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Facture {{ f.numero }}</title>
+<meta name="robots" content="noindex,nofollow"><style>
+body{font-family:Inter,system-ui,Arial,sans-serif;color:#14201a;background:#eef2ef;margin:0}.page{max-width:760px;margin:20px auto;background:#fff;padding:32px;border-radius:14px}
+.tete{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;border-bottom:2px solid #0b7a3b;padding-bottom:16px}.tete img{width:72px;height:72px;object-fit:cover;border-radius:14px}
+.ini{width:72px;height:72px;border-radius:14px;background:#0b7a3b;color:#fff;display:grid;place-items:center;font-size:2rem;font-weight:800}
+h1{margin:0;font-size:1.5rem}.mut{color:#69786f;font-size:.88rem}table{width:100%;border-collapse:collapse;margin:20px 0}th,td{padding:9px 6px;border-bottom:1px solid #e3e9e5;text-align:left}th{font-size:.75rem;text-transform:uppercase;color:#69786f}.r{text-align:right}
+.tot td{border:0;font-weight:700}.grand td{font-size:1.2rem;color:#0b7a3b;border-top:2px solid #0b7a3b}.annule{color:#d64545;font-weight:800;font-size:1.2rem;border:3px solid #d64545;display:inline-block;padding:4px 14px;transform:rotate(-4deg)}
+.btns{max-width:760px;margin:12px auto;display:flex;gap:8px;flex-wrap:wrap;padding:0 12px}.btns a,.btns button{background:#0b7a3b;color:#fff;border:0;border-radius:999px;padding:10px 18px;text-decoration:none;font-weight:700;cursor:pointer;font-family:inherit}
+.btns .sec{background:#fff;color:#0b7a3b;border:1.5px solid #0b7a3b}.btns .danger{background:#fff;color:#d64545;border:1.5px solid #d64545}
+@media print{.btns{display:none}body{background:#fff}.page{margin:0;border-radius:0}}</style></head><body>
+<div class="btns"><a class="sec" href="{{ url_for('espace_factures') }}">← Mes factures</a><a class="sec" href="{{ url_for('espace_caisse') }}">Caisse</a><button onclick="print()">🖨️ Imprimer / PDF</button>
+{% if f.client_tel %}<a class="sec" target="_blank" href="https://wa.me/{{ tel_wa(f.client_tel) }}?text={{ ('Bonjour, voici votre facture ' ~ f.numero ~ ' de ' ~ p.nom ~ ' : ' ~ (f.total|fcfa) ~ ' F. Merci !')|urlencode }}">💬 WhatsApp</a>{% endif %}
+{% if f.origine == 'comptoir' and f.statut != 'annulée' %}<form method="post" action="{{ url_for('espace_facture_annuler', id=f.id) }}" onsubmit="return confirm('Annuler cette facture ? Les articles reviennent en stock et un remboursement est noté en caisse.')"><input type="hidden" name="_csrf" value="{{ csrf_portail() }}"><button class="danger">Annuler la facture</button></form>{% endif %}</div>
+<div class="page"><div class="tete"><div style="display:flex;gap:14px;align-items:center">{% if p.logo %}<img src="{{ url_for('photo', nom=p.logo) }}" alt="">{% else %}<span class="ini">{{ initiale(p.nom) }}</span>{% endif %}
+<div><h1>{{ p.nom }}</h1><div class="mut">{{ p.adresse }}{% if p.adresse and p.quartier %} · {% endif %}{{ p.quartier }}</div>{% if p.tel %}<div class="mut">Tél. {{ p.tel }}</div>{% endif %}</div></div>
+<div style="text-align:right"><b>FACTURE</b><div>{{ f.numero }}</div><div class="mut">{{ f.cree_le[:16] }}</div><div class="mut">{{ 'Vente en ligne' if f.origine == 'en ligne' else 'Vente au comptoir' }}</div></div></div>
+{% if f.statut == 'annulée' %}<p><span class="annule">ANNULÉE</span></p>{% endif %}
+{% if f.client_nom or f.client_tel %}<p><b>Client :</b> {{ f.client_nom }} {% if f.client_tel %}· {{ f.client_tel }}{% endif %}</p>{% endif %}
+<table><tr><th>Article</th><th class="r">Prix</th><th class="r">Qté</th><th class="r">Montant</th></tr>
+{% for l in lignes %}<tr><td>{{ l.nom }}</td><td class="r">{{ l.prix|fcfa }} F</td><td class="r">{{ l.quantite|qte }}</td><td class="r">{{ (l.prix * l.quantite)|fcfa }} F</td></tr>{% endfor %}
+<tr class="tot"><td colspan="3" class="r">Sous-total</td><td class="r">{{ f.sous_total|fcfa }} F</td></tr>
+{% if f.remise %}<tr class="tot"><td colspan="3" class="r">Remise</td><td class="r">−{{ f.remise|fcfa }} F</td></tr>{% endif %}
+<tr class="tot grand"><td colspan="3" class="r">Total</td><td class="r">{{ f.total|fcfa }} F</td></tr></table>
+<p class="mut">Paiement : {{ f.moyen or '—' }}{% if f.note %} · {{ f.note }}{% endif %}</p><p class="mut" style="text-align:center;margin-top:30px">Merci pour votre achat !</p></div></body></html>"""
+
+
+def _articles_partenaire(pid):
+    with db() as con:
+        return con.execute("SELECT * FROM articles WHERE partenaire_id=? ORDER BY dispo DESC, nom", (pid,)).fetchall()
+
+
+def _nb_alertes(articles):
+    return sum(1 for a in articles if _etat_stock(a) in ("alerte", "épuisé"))
+
+
+@app.route("/espace/caisse")
+def espace_caisse():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    try:
+        synchroniser_ventes_en_ligne(p["id"])
+    except Exception:
+        log.exception("Synchronisation des ventes en ligne impossible pour le partenaire %s", p["id"])
+    j = _jour_valide(request.args.get("jour", ""))
+    jour = j.isoformat()
+    articles = _articles_partenaire(p["id"])
+    with db() as con:
+        mouvements = con.execute("SELECT * FROM caisse_partenaire WHERE partenaire_id=? AND date_operation=? ORDER BY id DESC",
+                                 (p["id"], jour)).fetchall()
+        en_ligne = con.execute("SELECT COALESCE(SUM(total),0) FROM factures_partenaire WHERE partenaire_id=? AND origine='en ligne' "
+                               "AND statut!='annulée' AND date(cree_le)=?", (p["id"], jour)).fetchone()[0]
+    moyens = {}
+    for m in mouvements:
+        d = moyens.setdefault(m["moyen"], {"moyen": m["moyen"], "entrees": 0, "sorties": 0})
+        d["entrees" if m["sens"] == "entree" else "sorties"] += m["montant"]
+    k = {"ventes": sum(m["montant"] for m in mouvements if m["sens"] == "entree" and m["categorie"] == "Vente comptoir"),
+         "entrees": sum(m["montant"] for m in mouvements if m["sens"] == "entree"),
+         "sorties": sum(m["montant"] for m in mouvements if m["sens"] == "sortie"),
+         "en_ligne": en_ligne, "alertes": _nb_alertes(articles)}
+    return reponse_portail(render_template_string(
+        PAGE_ESPACE_CAISSE, **_contexte_espace(p, "caisse", k=k, mouvements=mouvements, par_moyen=list(moyens.values()),
+                                                articles=articles, moyens=MOYENS_BOUTIQUE, jour=jour,
+                                                jour_affiche=j.strftime("%d/%m/%Y"),
+                                                prix={str(a["id"]): prix_effectif(a) or 0 for a in articles})))
+
+
+@app.route("/espace/caisse/vente", methods=["POST"])
+def espace_caisse_vente():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    panier = []
+    for a in _articles_partenaire(p["id"]):
+        q = nombre(request.form.get(f"q_{a['id']}", "0"))
+        if q and q > 0:
+            panier.append((a, float(q)))
+    if not panier:
+        return redirect(url_for("espace_caisse", msg="Choisissez au moins un article."))
+    sous_total = sum((prix_effectif(a) or 0) * q for a, q in panier)
+    remise = min(max(float(nombre(request.form.get("remise", "0")) or 0), 0), sous_total)
+    total = round(sous_total - remise)
+    moyen = request.form.get("moyen", "") if request.form.get("moyen", "") in MOYENS_BOUTIQUE else "Espèces"
+    client_nom = request.form.get("client_nom", "").strip()[:100]
+    client_tel = chiffres(request.form.get("client_tel", ""))
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        numero = _numero_facture(con, p["id"])
+        con.execute("INSERT INTO factures_partenaire(partenaire_id, numero, origine, client_nom, client_tel, sous_total, remise, total, "
+                    "moyen, statut, cree_le) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (p["id"], numero, "comptoir", client_nom, client_tel, sous_total, remise, total, moyen, "payée", maintenant()))
+        fid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for a, q in panier:
+            con.execute("INSERT INTO lignes_facture_partenaire(facture_id, article_id, nom, prix, quantite) VALUES (?,?,?,?,?)",
+                        (fid, a["id"], a["nom"], prix_effectif(a) or 0, q))
+            mouvement_stock(con, p["id"], a["id"], "sortie", q, "vente comptoir", note=numero, prix=prix_effectif(a) or 0, facture_id=fid, auto=True)
+        if total > 0:
+            con.execute("INSERT INTO caisse_partenaire(partenaire_id, sens, categorie, montant, moyen, facture_id, note, date_operation, cree_le) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", (p["id"], "entree", "Vente comptoir", total, moyen, fid,
+                                                       f"Facture {numero}" + (f" · {client_nom}" if client_nom else ""),
+                                                       date.today().isoformat(), maintenant()))
+        con.commit()
+    except ValueError as e:
+        con.rollback()
+        return redirect(url_for("espace_caisse", msg=str(e)))
+    except Exception:
+        con.rollback()
+        log.exception("Vente comptoir impossible")
+        return redirect(url_for("espace_caisse", msg="La vente n'a pas pu être enregistrée. Réessayez."))
+    finally:
+        con.close()
+    return redirect(url_for("espace_facture", id=fid))
+
+
+@app.route("/espace/caisse/mouvement", methods=["POST"])
+def espace_caisse_mouvement():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    sens = "entree" if request.form.get("sens") == "entree" else "sortie"
+    montant = nombre(request.form.get("montant", ""))
+    categorie = request.form.get("categorie", "").strip()[:60]
+    moyen = request.form.get("moyen", "") if request.form.get("moyen", "") in MOYENS_BOUTIQUE else "Espèces"
+    if not montant or montant <= 0 or not categorie:
+        return redirect(url_for("espace_caisse", msg="Indiquez une catégorie et un montant valide."))
+    with db() as con:
+        con.execute("INSERT INTO caisse_partenaire(partenaire_id, sens, categorie, montant, moyen, note, date_operation, cree_le) "
+                    "VALUES (?,?,?,?,?,?,?,?)", (p["id"], sens, categorie, round(montant), moyen,
+                                                 request.form.get("note", "").strip()[:200], date.today().isoformat(), maintenant()))
+    return redirect(url_for("espace_caisse", msg="Mouvement de caisse enregistré."))
+
+
+@app.route("/espace/stock")
+def espace_stock():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    try:
+        synchroniser_ventes_en_ligne(p["id"])
+    except Exception:
+        log.exception("Synchronisation des ventes en ligne impossible pour le partenaire %s", p["id"])
+    articles = _articles_partenaire(p["id"])
+    with db() as con:
+        mouvements = con.execute("SELECT * FROM mouvements_stock WHERE partenaire_id=? ORDER BY id DESC LIMIT 80", (p["id"],)).fetchall()
+    suivis = [a for a in articles if a["suivi_stock"]]
+    k = {"suivis": len(suivis), "alertes": sum(1 for a in suivis if _etat_stock(a) == "alerte"),
+         "epuises": sum(1 for a in suivis if _etat_stock(a) == "épuisé"),
+         "valeur_achat": sum(max(a["stock"] or 0, 0) * (a["prix_achat"] or 0) for a in suivis),
+         "valeur_vente": sum(max(a["stock"] or 0, 0) * (prix_effectif(a) or 0) for a in suivis)}
+    return reponse_portail(render_template_string(
+        PAGE_ESPACE_STOCK, **_contexte_espace(p, "stock", articles=articles, mouvements=mouvements, k=k)))
+
+
+@app.route("/espace/stock/mouvement", methods=["POST"])
+def espace_stock_mouvement():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    sens = "entree" if request.form.get("sens") == "entree" else "sortie"
+    aid = request.form.get("article_id", "")
+    q = nombre(request.form.get("quantite", ""))
+    prix = max(float(nombre(request.form.get("prix", "")) or 0), 0)
+    motif = request.form.get("motif", "").strip()[:60] or ("Entrée" if sens == "entree" else "Sortie")
+    if not aid.isdigit() or not q or q <= 0:
+        return redirect(url_for("espace_stock", msg="Choisissez un article et une quantité valide."))
+    try:
+        with db() as con:
+            mouvement_stock(con, p["id"], int(aid), sens, q, motif, note=request.form.get("note", ""), prix=prix)
+            if sens == "entree":
+                con.execute("UPDATE articles SET suivi_stock=1" + (", prix_achat=?" if prix else "") + " WHERE id=? AND partenaire_id=?",
+                            ((prix, int(aid), p["id"]) if prix else (int(aid), p["id"])))
+                if request.form.get("payer") == "1" and prix:
+                    con.execute("INSERT INTO caisse_partenaire(partenaire_id, sens, categorie, montant, moyen, note, date_operation, cree_le) "
+                                "VALUES (?,?,?,?,?,?,?,?)", (p["id"], "sortie", "Achat marchandises", round(prix * q), "Espèces",
+                                                             request.form.get("note", "").strip()[:200], date.today().isoformat(), maintenant()))
+    except ValueError as e:
+        return redirect(url_for("espace_stock", msg=str(e)))
+    return redirect(url_for("espace_stock", msg="Stock mis à jour."))
+
+
+@app.route("/espace/stock/article/<int:aid>", methods=["POST"])
+def espace_stock_article(aid):
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    suivi = 1 if request.form.get("suivi_stock") else 0
+    seuil = max(float(nombre(request.form.get("seuil_alerte", "")) or 0), 0)
+    prix_achat = max(float(nombre(request.form.get("prix_achat", "")) or 0), 0)
+    reel_txt = request.form.get("stock_reel", "").strip()
+    reel = nombre(reel_txt) if reel_txt else None
+    with db() as con:
+        a = con.execute("SELECT * FROM articles WHERE id=? AND partenaire_id=?", (aid, p["id"])).fetchone()
+        if not a:
+            abort(404)
+        con.execute("UPDATE articles SET suivi_stock=?, seuil_alerte=?, prix_achat=? WHERE id=?", (suivi, seuil, prix_achat, aid))
+        if reel is not None and reel >= 0:
+            ecart = round(reel - (a["stock"] or 0), 3)
+            if ecart:
+                mouvement_stock(con, p["id"], aid, "entree" if ecart > 0 else "sortie", abs(ecart), "inventaire (comptage)",
+                                note=f"Stock compté : {qte_txt(reel)}", controle=False)
+    return redirect(url_for("espace_stock", msg=f"« {a['nom']} » enregistré."))
+
+
+@app.route("/espace/factures")
+def espace_factures():
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    try:
+        synchroniser_ventes_en_ligne(p["id"])
+    except Exception:
+        log.exception("Synchronisation des ventes en ligne impossible pour le partenaire %s", p["id"])
+    mois = request.args.get("mois", "")
+    if not re.fullmatch(r"\d{4}-\d{2}", mois):
+        mois = datetime.now().strftime("%Y-%m")
+    with db() as con:
+        factures = con.execute("SELECT * FROM factures_partenaire WHERE partenaire_id=? AND substr(cree_le,1,7)=? ORDER BY id DESC",
+                               (p["id"], mois)).fetchall()
+    ok = [f for f in factures if f["statut"] != "annulée"]
+    k = {"n": len(ok), "comptoir": sum(f["total"] for f in ok if f["origine"] == "comptoir"),
+         "en_ligne": sum(f["total"] for f in ok if f["origine"] == "en ligne")}
+    return reponse_portail(render_template_string(
+        PAGE_ESPACE_FACTURES, **_contexte_espace(p, "factures", factures=factures, k=k, mois=mois)))
+
+
+@app.route("/espace/facture/<int:id>")
+def espace_facture(id):
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    with db() as con:
+        f = con.execute("SELECT * FROM factures_partenaire WHERE id=? AND partenaire_id=?", (id, p["id"])).fetchone()
+        lignes = con.execute("SELECT * FROM lignes_facture_partenaire WHERE facture_id=? ORDER BY id", (id,)).fetchall() if f else []
+    if not f:
+        abort(404)
+    return reponse_portail(render_template_string(PAGE_FACTURE_PARTENAIRE, f=f, lignes=lignes, p=p))
+
+
+@app.route("/espace/facture/<int:id>/annuler", methods=["POST"])
+def espace_facture_annuler(id):
+    identite, reponse = _auth_portail("partenaire")
+    if reponse:
+        return reponse
+    p = identite["profil"]
+    with db() as con:
+        f = con.execute("SELECT * FROM factures_partenaire WHERE id=? AND partenaire_id=? AND origine='comptoir' AND statut!='annulée'",
+                        (id, p["id"])).fetchone()
+        if not f:
+            return redirect(url_for("espace_factures", msg="Facture introuvable ou déjà annulée."))
+        con.execute("UPDATE factures_partenaire SET statut='annulée' WHERE id=?", (id,))
+        for l in con.execute("SELECT * FROM lignes_facture_partenaire WHERE facture_id=?", (id,)).fetchall():
+            if l["article_id"] and (l["quantite"] or 0) > 0 and con.execute(
+                    "SELECT 1 FROM mouvements_stock WHERE facture_id=? AND article_id=? AND sens='sortie'", (id, l["article_id"])).fetchone():
+                mouvement_stock(con, p["id"], l["article_id"], "entree", l["quantite"], "annulation de facture",
+                                note=f["numero"], facture_id=id, auto=True)
+        if (f["total"] or 0) > 0:
+            con.execute("INSERT INTO caisse_partenaire(partenaire_id, sens, categorie, montant, moyen, facture_id, note, date_operation, cree_le) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", (p["id"], "sortie", "Remboursement", f["total"], f["moyen"] or "Espèces", id,
+                                                       f"Annulation facture {f['numero']}", date.today().isoformat(), maintenant()))
+    return redirect(url_for("espace_facture", id=id))
+
+
+PAGE_PORTAIL_LIVREUR = PAGE_PORTAIL_LIVREUR.replace('<h2 class="s">📍 Mes courses</h2>', GPS_LIVREUR + '<h2 class="s">📍 Mes courses</h2>', 1)
+PAGE_COMPTE_PARTENAIRE = PAGE_COMPTE_PARTENAIRE.replace('<section class="acct-card"><h2>👤 Profil public</h2>',
+                                                        BLOC_IMAGES_PARTENAIRE + '<section class="acct-card"><h2>👤 Profil public</h2>', 1)
+PAGE_COMPTE_PARTENAIRE = PAGE_COMPTE_PARTENAIRE.replace("</body></html>", str(SCRIPT_PHOTOS) + "</body></html>")
+
+
+if __name__ == "__main__":
+    init_db()
+    threading.Thread(target=boucle_relance, daemon=True).start()  # relance des livreurs
+    threading.Thread(target=boucle_sauvegarde, daemon=True).start()  # sauvegarde automatique
+    # host 0.0.0.0 : accessible aussi depuis ton téléphone sur le même Wi-Fi
+    port = max(1, int(os.environ.get("PORT", "5001")))
+    while port <= 5100:
+        try:
+            app.run(host="0.0.0.0", port=port, debug=False)
+            break
+        except OSError as erreur:
+            port_occupe = (getattr(erreur, "winerror", None) == 10048 or
+                           getattr(erreur, "errno", None) in (98, 10048))
+            if not port_occupe:
+                raise
+            print(f"Port {port} deja utilise; prochaine adresse : http://localhost:{port + 1}", flush=True)
+            port += 1
+    if port > 5100:
+        raise RuntimeError("Aucun port libre entre 5001 et 5100.")

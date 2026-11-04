@@ -1,0 +1,93 @@
+BASE DE DONNEES DE LIVRAISONS - MODE D'EMPLOI
+
+1) INSTALLATION (une seule fois)
+   Ouvre l'invite de commandes dans le dossier C:\x\livraisons, puis :
+       python -m pip install -r requirements.txt
+
+2) CLE API CLAUDE (facultatif)
+   Cree une cle sur console.anthropic.com, puis dans cmd :
+       setx ANTHROPIC_API_KEY "ta_cle_ici"
+   Ferme et rouvre cmd ensuite.
+   Sans cle, l'application marche quand meme : tu remplis a la main.
+
+3) LANCEMENT (a chaque fois)
+   Double-clique sur lancer.bat dans C:\x\livraisons.
+   Ouvre l'adresse affichee dans la fenetre noire dans Chrome.
+   Le lanceur reutilise l'application deja ouverte ou choisit un port libre
+   entre 5001 et 5100 si le port habituel est occupe.
+   Garde la fenetre noire ouverte tant que tu utilises l'application.
+
+   Pour lancer depuis cmd :
+       cd /d C:\x\livraisons
+       set "DONNEES_DIR=C:\x\livraisons\Nouveau dossier"
+       python app.py
+
+4) UTILISATION
+   - "+ Nouvelle livraison" : colle le message du client, clique
+     "Analyser avec Claude", verifie, enregistre.
+   - Dans le tableau de bord : boutons Collecte / Livre / Paye.
+     L'heure s'enregistre toute seule.
+   - "Exporter CSV" : fichier lisible dans Excel ou Google Sheets.
+   - Dans "Revenus" : saisis les versements que tu fais aux livreurs.
+
+5) DEPUIS TON TELEPHONE (meme Wi-Fi que le PC)
+   Trouve l'adresse IP du PC (commande : ipconfig, ligne "Adresse IPv4"),
+   puis ouvre http://ADRESSE_IP:PORT_AFFICHE sur le telephone.
+   Le PC doit rester allume avec l'application lancee.
+
+6) ESPACES ET ACCES SEPARES
+   - Responsable : l'espace complet s'ouvre sur ce PC. Pour l'utiliser aussi
+     depuis le Wi-Fi, configure un mot de passe administrateur dans Windows :
+         setx APP_MOT_DE_PASSE "choisir-un-mot-de-passe-long"
+     Ferme puis relance lancer.bat. Ne partage pas ce mot de passe aux livreurs
+     ni aux partenaires.
+    - Livreur : ouvre Livreurs > Fiche. Dans « Compte privé du livreur »,
+      choisis un identifiant et un mot de passe (12 caractères minimum), puis
+      transmets-les au livreur par un canal prive. Il se connecte sur /connexion,
+      puis peut modifier son nom, son telephone, son quartier, son identifiant
+      et son mot de passe dans « Mon profil et mon compte ».
+    - Partenaire : ouvre Partenaires > Fiche. Dans « Compte privé du partenaire »,
+      cree ses identifiants et transmets-les-lui de façon privee. Il accede a ses
+      commandes, son catalogue, son releve et peut modifier ses coordonnees, la
+      presentation de sa boutique, son identifiant et son mot de passe.
+    Les mots de passe sont stockes sous forme de hachage. Les anciens liens secrets
+    renvoient desormais vers la page de connexion et ne donnent plus acces aux donnees.
+
+   Pour partager les portails depuis Internet, configure l'adresse publique du
+   tunnel puis active leur acces externe :
+       setx URL_PUBLIQUE "https://ton-adresse-publique"
+       setx BOUTIQUE_PUBLIQUE "1"
+    Ferme et relance lancer.bat apres ces changements. Le mot de passe administrateur
+    reste necessaire pour ouvrir l'espace complet depuis Internet. Chaque livreur et
+    partenaire doit utiliser l'adresse /connexion avec ses propres identifiants.
+
+L'application est dans app.py a la racine du dossier.
+Les donnees restent dans Nouveau dossier\livraisons.db, a cote du journal.
+7) PROTECTION DES DONNEES
+   - La base utilisée par lancer.bat est Nouveau dossier\livraisons.db.
+   - Un ancien fichier livraisons.db peut aussi se trouver à la racine. Ne le
+     copie pas par-dessus la base active et ne le supprime pas sans vérification.
+   - Le lanceur s'arrête maintenant si la base attendue manque alors qu'une
+     autre base existe. Cela évite de créer silencieusement une base vide.
+   - Une copie SQLite vérifiée est créée automatiquement dans
+     Nouveau dossier\sauvegardes. La rétention est de 30 jours.
+   - Ces copies locales restent sur le même PC. Pour une copie hors du PC,
+     configure SAUVEGARDE_DOSSIER vers un dossier synchronisé que tu utilises :
+       setx SAUVEGARDE_DOSSIER "C:\chemin\vers\dossier_synchronise"
+     Puis ferme et relance lancer.bat. Vérifie les deux destinations dans
+     l'espace Sauvegardes de l'application.
+
+8) VERSION INSTALLABLE SUR TÉLÉPHONE
+   Les espaces Responsable, Livreur et Partenaire ont maintenant une version
+   installable depuis le navigateur, avec leur propre nom et leur icône LIR.
+   Ouvre l'espace souhaité puis touche « Installer l’application ».
+
+   Important : cette installation ajoute une icône et ouvre l'application en
+   plein écran ; elle ne met pas le serveur ni la base de données dans le
+   téléphone. Pour l'installer et l'utiliser depuis un téléphone à distance,
+   il faudra une adresse HTTPS accessible depuis Internet. L'adresse locale
+   localhost ne fonctionne que sur le PC où l'application tourne.
+
+   Les pages et les données de livraison ne sont pas enregistrées hors ligne.
+   Sans connexion au serveur, l'application affiche un message et permet de
+   réessayer une fois la connexion rétablie.

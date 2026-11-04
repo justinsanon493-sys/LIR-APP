@@ -1,0 +1,53 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "8000"
+      DONNEES_DIR: /data
+      REQUIRE_EXISTING_DB: "1"
+      SESSION_COOKIE_SECURE: "1"
+      APP_SESSION_SECRET: ${APP_SESSION_SECRET:?Definis APP_SESSION_SECRET dans .env}
+      APP_MOT_DE_PASSE: ${APP_MOT_DE_PASSE:?Definis APP_MOT_DE_PASSE dans .env}
+      URL_PUBLIQUE: ${URL_PUBLIQUE:?Definis URL_PUBLIQUE dans .env}
+      BOUTIQUE_PUBLIQUE: ${BOUTIQUE_PUBLIQUE:-1}
+    volumes:
+      - ./data:/data
+    expose:
+      - "8000"
+    stop_grace_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
+
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      DOMAINE: ${DOMAINE:?Definis DOMAINE dans .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

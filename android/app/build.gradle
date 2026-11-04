@@ -1,0 +1,26 @@
+plugins { id 'com.android.application' }
+
+def lirUrl = providers.gradleProperty("lirUrl").getOrElse("https://example.invalid")
+def localDev = lirUrl.startsWith("http://")
+
+android {
+    namespace 'bf.lir.livraisons'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'bf.lir.livraisons'
+        minSdk 26
+        targetSdk 36
+        versionCode 1
+        versionName '1.0.0'
+        buildConfigField 'String', 'LIR_URL', '"' + lirUrl + '"'
+        manifestPlaceholders = [allowCleartext: localDev ? 'true' : 'false']
+    }
+
+    buildFeatures { buildConfig true }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.core:core:1.13.1'
+}

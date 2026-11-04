@@ -1,0 +1,3 @@
+﻿id,numero,cree_le,canal,client_nom,client_tel,collecte_lieu,collecte_quartier,livraison_adresse,livraison_quartier,destinataire_nom,destinataire_tel,colis,valeur_produit,prix_course,mode_paiement,statut_paiement,frais,distance_km,statut,heure_collecte,heure_livraison,heure_paiement,remarques,message_original
+1,LIV-0001,2026-10-07 19:37,WhatsApp,m Somé,55288236,afimed,Zone 1,,Boulmiougou,m; Somé,53820635,Produit veterinere,17500.0,1500.0,Orange Money,payé,1000.0,12.0,livré,2026-10-07 19:48,2026-10-07 19:49,2026-10-07 19:49,,
+2,LIV-0002,2026-10-07 19:47,WhatsApp,m. Traoré,74281145,Vista bank Zogona,pissy,,Zogona,M. Baki,53820635,biscuit,1000.0,1000.0,Orange Money,payé,500.0,10.0,livré,,,,,

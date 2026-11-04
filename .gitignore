@@ -1,0 +1,27 @@
+.env
+.env.*
+!.env.hebergement.example
+data/
+Nouveau dossier/
+sauvegardes/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+.session_secret
+**/.session_secret
+__pycache__/
+**/__pycache__/
+*.py[cod]
+android/.gradle/
+android/app/build/
+android/build/
+*.jks
+*.keystore
+key.properties
+app_avant_*.py
+wsgi_avant_*.py
+HEBERGEMENT_avant_*.txt
+.aider*

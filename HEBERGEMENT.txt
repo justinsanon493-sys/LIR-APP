@@ -1,0 +1,114 @@
+HEBERGEMENT EN LIGNE — ACCÈS DEPUIS PLUSIEURS TÉLÉPHONES
+========================================================
+
+OBJECTIF
+--------
+Les téléphones se connectent à la même adresse HTTPS. L'application tourne sur
+un seul serveur Linux toujours disponible. La base SQLite reste sur un disque
+persistant du serveur, en mode WAL, avec un seul processus applicatif et huit
+threads. C'est le chemin le plus court pour une petite équipe; il évite une
+réécriture risquée de la base actuelle. Une migration vers PostgreSQL sera à
+étudier si le nombre d'utilisateurs ou le volume augmente fortement.
+
+AVANT LE PAIEMENT
+-----------------
+L'application peut continuer à tourner localement avec lancer.bat. Le dossier
+android/ prépare l'application Android, mais la version destinée au Play Store
+doit être construite avec une URL HTTPS publique après le déploiement. La page
+publique de confidentialité sera alors disponible sur /confidentialite.
+
+CE QUI EST PRÉPARÉ DANS CE DOSSIER
+---------------------------------
+  Dockerfile       image de l'application, utilisateur non administrateur
+  compose.yaml     application + proxy HTTPS Caddy + stockage local persistant
+  Caddyfile        certificat HTTPS automatique pour le domaine configuré
+  .dockerignore    exclut bases, sauvegardes, journaux et secrets de l'image
+  .env.hebergement.example   modèle sans identifiants réels
+
+AUCUNE DONNÉE NI CLÉ N'EST COPIÉE DANS L'IMAGE DOCKER. Le dossier data/ du
+serveur est monté séparément sur /data et contient la base utilisée en ligne.
+
+PRÉREQUIS AVANT LA MISE EN LIGNE
+-------------------------------
+  1. Un petit serveur Linux avec Docker Compose et un disque persistant.
+  2. Un nom de domaine dont le DNS pointe vers ce serveur.
+  3. Les ports 80 et 443 autorisés vers le serveur pour que Caddy active HTTPS.
+  4. Un mot de passe d'administration réservé au responsable.
+  5. Les secrets Meta / WhatsApp ou IA à renseigner séparément si tu les utilises.
+
+OPTION DE DEPART RECOMMANDEE (tarifs consultes le 18/10/2026)
+-------------------------------------------------------------
+DigitalOcean Basic : 2 Gio de RAM, 1 vCPU et 50 Gio SSD à 12 $US/mois.
+La sauvegarde quotidienne du serveur ajoute 30 %, soit environ 15,60 $US/mois
+serveur + sauvegarde, avant taxes et nom de domaine. La région AMS3 (Amsterdam)
+est disponible; c'est un choix géographique raisonnable pour Ouagadougou, mais
+la latence réelle dépendra des opérateurs mobiles.
+Paiement : cartes de crédit/débit ou PayPal sont annoncés; l'acceptation d'une
+carte émise au Burkina Faso doit être vérifiée au moment de créer le compte.
+Tarifs officiels :
+  https://www.digitalocean.com/pricing/droplets
+  https://docs.digitalocean.com/products/backups/details/pricing/
+  https://docs.digitalocean.com/platform/regional-availability/
+
+Cette option est une recommandation : aucun compte n'a été créé et aucun achat
+n'a été effectué.
+
+Le choix et le paiement du serveur et du domaine restent à faire avec toi. Ne
+transmets pas la base de données ni les clés API dans une conversation.
+
+PRÉPARER LE SERVEUR
+-------------------
+  1. Copie les fichiers du projet sur le serveur. N'envoie pas le dossier
+     « Nouveau dossier », les sauvegardes locales, ni les fichiers .session_secret.
+  2. Dans le dossier du projet, copie .env.hebergement.example vers .env.
+  3. Modifie .env : domaine réel, URL https correspondante, mot de passe admin
+     long et clé de session aléatoire. Exemple pour générer une clé sur Linux :
+         openssl rand -hex 48
+     Garde .env privé, avec des droits de lecture réservés au compte serveur.
+  4. Configure le DNS du domaine vers le serveur et ouvre les ports 80 et 443.
+  5. Crée le dossier data/ à côté de compose.yaml.
+     Le démarrage en ligne refuse de créer une base vide si livraisons.db manque.
+
+TRANSFÉRER LES DONNÉES SANS PERDRE L'EXISTANT
+--------------------------------------------
+  1. Depuis l'application actuelle, choisis la dernière sauvegarde vérifiée de
+     « Nouveau dossier/sauvegardes ». Ne prends pas l'ancien livraisons.db situé
+     à la racine de C:\x\livraisons.
+  2. Transfère cette copie vers le serveur par SFTP/SSH, dans data/livraisons.db.
+     Ne copie pas la base active pendant que le serveur local fonctionne; utilise
+     une sauvegarde vérifiée afin d'inclure correctement les écritures du WAL.
+  3. Sur le serveur, rends le dossier data/ accessible à l'utilisateur du
+     conteneur (UID 10001), puis vérifie que data/livraisons.db est présent.
+  4. Seulement après cette vérification, démarre les services.
+
+DÉMARRAGE
+---------
+Dans le dossier du projet sur le serveur :
+    docker compose up -d --build
+    docker compose ps
+    docker compose logs --tail=100 web proxy
+
+L'application répond sur https://DOMAINE/. Les livreurs et partenaires utilisent
+la même adresse puis se connectent à /connexion avec leurs comptes personnels.
+L'administration demande le mot de passe configuré dans APP_MOT_DE_PASSE.
+Le PC de l'équipe n'a plus besoin de rester allumé et ngrok n'est plus utilisé.
+
+RÈGLES D'EXPLOITATION
+---------------------
+  - Garde une seule instance du service web : wsgi.py lance aussi les tâches
+    automatiques de relance et de sauvegarde. Ne monte pas plusieurs réplicas.
+  - Ne supprime jamais le dossier data/ : il contient la base et les sauvegardes.
+    Le fichier .env contient la cle de session et les secrets d'acces.
+  - La sauvegarde automatique actuelle est stockée dans data/sauvegardes, donc
+    sur le même serveur. Configure aussi une copie hors serveur et vérifie
+    régulièrement qu'elle peut être restaurée.
+  - Pour déployer une nouvelle version, conserve data/ et .env puis relance
+    « docker compose up -d --build ». Ne remplace pas la base par une base vide.
+  - Une coupure internet sur un téléphone interrompra momentanément l'accès;
+    l'application n'a pas encore de mode hors ligne avec synchronisation.
+
+CONTRÔLE DE SANTÉ
+-----------------
+La route /healthz répond seulement « ok » quand l'application et le schéma de la
+base sont disponibles. Elle ne renvoie ni données ni chemin de fichier. Le proxy
+l'utilise pour attendre que l'application soit prête.
