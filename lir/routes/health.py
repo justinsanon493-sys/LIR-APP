@@ -1,10 +1,10 @@
-"""Health routes."""
+"""Health route for the web application."""
 
-from flask import Blueprint
+from flask import Blueprint, jsonify
 
 bp = Blueprint("health", __name__)
 
 
-@bp.route("/healthz")
+@bp.get("/healthz")
 def healthz():
-    return {"ok": True, "service": "LIR"}
+    return jsonify({"ok": True})

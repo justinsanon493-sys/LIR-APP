@@ -1,7 +1,8 @@
-"""Route package.
+"""Route registry for migrated LIR domains."""
 
-Routes are migrated from the legacy root app in domain-sized steps. Do not
-register placeholder routes here: the live app remains in `app.py` until a
-route is fully migrated.
-"""
+from .health import bp as health_bp
 
+
+def register_blueprints(app):
+    app.register_blueprint(health_bp)
+    return app
