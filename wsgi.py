@@ -1,49 +1,36 @@
 """Entrypoint for local Waitress and hosted single-process deployment.
 
-This keeps the project structured around the new `lir` package while still
-being compatible with the legacy `app.py` business logic and optional modules.
+Production still uses the established root Flask app until its routes and
+migrations have been moved safely into the `lir` package. This bridge ensures
+that merely introducing the package does not replace the real app with
+placeholder routes.
 """
 
 import importlib
 import os
 import threading
 
+import app as legacy_app
 from lir import create_app
 
-app = create_app()
+application = create_app(legacy_app.app)
 
-# Compatibility layer: if the legacy application exists, keep its initialization
-# and long-running loops. This is deliberately optional so the refactor can be
-# incremental without breaking startup.
-try:
-    import app as legacy_app  # noqa: F401
-except Exception:  # pragma: no cover - legacy app may be absent during migration
-    legacy_app = None
+legacy_app.init_db()
 
-if legacy_app is not None:
+# Optional domain modules register routes on the legacy Flask app. Keep this
+# behavior during the incremental migration.
+for _module_name, _label in (("modules.services_lir", "Services"), ("modules.tournee_lir", "Tournée et assignation")):
     try:
-        legacy_app.init_db()
-    except Exception as exc:  # pragma: no cover
-        print(f"Legacy init_db() non disponible ou invalide : {exc!r}", flush=True)
+        importlib.import_module(_module_name)
+    except ModuleNotFoundError as error:
+        if error.name != _module_name:
+            print(f"Module {_label} non chargé : {error!r}", flush=True)
+    except Exception as error:
+        print(f"Module {_label} non chargé : {error!r}", flush=True)
 
-    for _nom_module, _libelle in (("modules.services_lir", "Services"), ("modules.tournee_lir", "Tournée et assignation")):
-        try:
-            importlib.import_module(_nom_module)
-        except ModuleNotFoundError as erreur:
-            if erreur.name != _nom_module:
-                print(f"Module {_libelle} non chargé : {erreur!r}", flush=True)
-        except Exception as erreur:
-            print(f"Module {_libelle} non chargé : {erreur!r}", flush=True)
-
-    db_name = getattr(legacy_app, "DB", None) or getattr(legacy_app, "db", None)
-    print(f"Base de données active : {db_name}", flush=True)
-
-    if hasattr(legacy_app, "boucle_relance"):
-        threading.Thread(target=legacy_app.boucle_relance, daemon=True).start()
-    if hasattr(legacy_app, "boucle_sauvegarde"):
-        threading.Thread(target=legacy_app.boucle_sauvegarde, daemon=True).start()
-
-application = app
+print(f"Base de données active : {legacy_app.DB}", flush=True)
+threading.Thread(target=legacy_app.boucle_relance, daemon=True).start()
+threading.Thread(target=legacy_app.boucle_sauvegarde, daemon=True).start()
 
 if __name__ == "__main__":
     host = "0.0.0.0"

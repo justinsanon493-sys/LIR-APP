@@ -1,15 +1,17 @@
-"""Core application package for LIR."""
+"""Transitional Flask app factory.
 
-from flask import Flask
+The legacy implementation in the repository root still owns the production
+routes and database migrations. Returning that instance here keeps all existing
+URLs and behavior intact while new domains are migrated incrementally into
+`lir.routes` and `lir.services`.
+"""
 
-from .config import Config
-from .logging_config import configure_logging
-from .routes import register_blueprints
 
+def create_app(legacy_application=None):
+    if legacy_application is not None:
+        return legacy_application
 
-def create_app(config_class=Config):
-    app = Flask(__name__)
-    app.config.from_object(config_class)
-    configure_logging(app)
-    register_blueprints(app)
-    return app
+    # Import lazily to avoid a package-import cycle while app.py is loading.
+    import app as legacy_app
+
+    return legacy_app.app
