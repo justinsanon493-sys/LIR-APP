@@ -1,0 +1,23 @@
+"""Base Jinja template."""
+
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}LIR{% endblock %}</title>
+    {% block head %}{% endblock %}
+  </head>
+  <body>
+    <header>
+      <h1>LIR</h1>
+      {% block nav %}{% endblock %}
+    </header>
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+    <footer>
+      {% block footer %}{% endblock %}
+    </footer>
+  </body>
+</html>
